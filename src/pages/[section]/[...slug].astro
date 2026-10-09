@@ -1,0 +1,41 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { SITE } from '../../site';
+import { getCollection, render } from 'astro:content';
+import { SECTIONS } from '../../sections';
+import { formatDate } from '../../lib/content';
+
+export async function getStaticPaths() {
+  const paths = await Promise.all(
+    SECTIONS.map(async (s) => {
+      const entries = await getCollection(s.slug as any);
+      return entries.map((entry: any) => ({
+        params: { section: s.slug, slug: entry.id },
+        props: { entry, sectionMeta: s },
+      }));
+    })
+  );
+  return paths.flat();
+}
+
+const { entry, sectionMeta } = Astro.props;
+const { Content } = await render(entry);
+const { title, pubDate, tags, description, link } = entry.data;
+---
+
+<BaseLayout title={`${title} · ${sectionMeta.label} · ${SITE.name}`} description={description}>
+  <p class="breadcrumb"><a href="/">知识库</a> › <a href={`/${sectionMeta.slug}/`}>{sectionMeta.label}</a> › 正文</p>
+
+  <article class="prose">
+    <span class="section-chip">{sectionMeta.emoji} {sectionMeta.label}</span>
+    <h1 style="margin-top:.8rem">{title}</h1>
+    <div class="post-meta">
+      <time datetime={pubDate.toISOString()}>{formatDate(pubDate)}</time>
+      {tags.map((t: string) => <span class="tag">{t}</span>)}
+      {link && <a href={link} target="_blank" rel="noopener noreferrer">原文链接 ↗</a>}
+    </div>
+    <Content />
+  </article>
+
+  <p style="margin-top:3rem"><a class="backlink" href={`/${sectionMeta.slug}/`}>‹ 返回{sectionMeta.label}</a></p>
+</BaseLayout>

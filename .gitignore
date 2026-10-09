@@ -1,0 +1,17 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+.astro/
+
+# 飞书凭证 —— 绝对不要提交到 GitHub！
+.env
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+
+# 截图临时文件
+.preview-*.png
+.final-*.png

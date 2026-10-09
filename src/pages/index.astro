@@ -1,0 +1,56 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { getOverview, formatDate } from '../lib/content';
+
+const overview = await getOverview();
+const recent = overview
+  .flatMap((s) => s.latest.map((e) => ({ ...e, sectionLabel: s.label, emoji: s.emoji })))
+  .sort((a, b) => b.pubDate.valueOf() - a.pubDate.valueOf())
+  .slice(0, 8);
+---
+
+<BaseLayout>
+  <section class="hero">
+    <span class="hero-badge">个人知识库 · 持续更新</span>
+    <h1>写作、分享与面试准备</h1>
+    <p>
+      这里是我的个人知识库：自己的文章与项目、值得分享的好文章和项目、以及面试所需的八股总结与面经复盘。
+      内容在飞书文档里写作，一键同步到这里。
+    </p>
+  </section>
+
+  <h2 style="font-size:1.25rem;font-weight:900;margin:0 0 1rem">🗺 知识地图</h2>
+  <p style="color:var(--subtle);font-size:.9rem;margin:0 0 1.2rem">按目标进入 · {overview.length} 个核心板块</p>
+
+  <div class="map-grid">
+    {overview.map((s, i) => (
+      <a class="map-card" href={`/${s.slug}/`}>
+        <span class="num">{String(i + 1).padStart(2, '0')}</span>
+        <h2>{s.emoji} {s.label}</h2>
+        <p class="desc">{s.description}</p>
+        <div class="meta">
+          <span>{s.count} 篇</span>
+          <span class="arrow">→</span>
+        </div>
+      </a>
+    ))}
+  </div>
+
+  <h2 style="font-size:1.25rem;font-weight:900;margin:2.8rem 0 1rem">🕐 最近更新</h2>
+  <div class="index-list">
+    {recent.map((item) => (
+      <a class="index-item" href={item.href}>
+        <span class="num">{item.emoji}</span>
+        <span class="body">
+          <span class="title">{item.title}</span>
+          <span class="desc">{item.description}</span>
+        </span>
+        <span class="side">
+          <span class="tag">{item.sectionLabel}</span>
+          {formatDate(item.pubDate)}
+        </span>
+        <span class="arrow">→</span>
+      </a>
+    ))}
+  </div>
+</BaseLayout>

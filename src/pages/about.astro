@@ -1,0 +1,21 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { SITE } from '../site';
+---
+
+<BaseLayout title={`关于 · ${SITE.name}`}>
+  <p class="breadcrumb"><a href="/">知识库</a> › 关于</p>
+  <article class="prose">
+    <h1>关于我</h1>
+    <p>你好！这是我的个人知识库，一共六个板块：</p>
+    <ul>
+      <li><strong>✍️ 个人文章</strong> —— 我自己写的思考、记录与复盘</li>
+      <li><strong>📖 文章分享</strong> —— 我读到的觉得好的文章，附原文链接与我的分析</li>
+      <li><strong>🧱 八股总结</strong> —— 面试常见知识点，系统整理、集中复习</li>
+      <li><strong>🎯 面试汇总</strong> —— 面经与面试复盘：流程、题目、考点与延伸</li>
+      <li><strong>🛠️ 个人项目</strong> —— 我做过的项目：背景、方案、踩坑与收获</li>
+      <li><strong>🔭 项目分享</strong> —— 值得学习的开源项目拆解与分析</li>
+    </ul>
+    <p>博客文章主要在飞书文档里写作，通过脚本自动同步到这里；站点用 Astro 构建，支持全站搜索。</p>
+  </article>
+</BaseLayout>

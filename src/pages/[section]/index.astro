@@ -1,0 +1,45 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { SITE } from '../../site';
+import { SECTIONS } from '../../sections';
+import { getSectionEntries, formatDate } from '../../lib/content';
+
+export async function getStaticPaths() {
+  return SECTIONS.map((s) => ({ params: { section: s.slug } }));
+}
+
+const { section } = Astro.params;
+const meta = SECTIONS.find((s) => s.slug === section)!;
+const entries = await getSectionEntries(section!);
+---
+
+<BaseLayout title={`${meta.label} · ${SITE.name}`} description={meta.description}>
+  <p class="breadcrumb"><a href="/">知识库</a> › {meta.label}</p>
+
+  <header class="section-head">
+    <h1>{meta.emoji} {meta.label}</h1>
+    <p class="lead">{meta.description} 共 {entries.length} 篇。</p>
+  </header>
+
+  {entries.length === 0 ? (
+    <p style="color:var(--subtle)">这个板块还没有内容，快去写第一篇吧。</p>
+  ) : (
+    <div class="index-list">
+      {entries.map((entry, i) => (
+        <a class="index-item" href={entry.href}>
+          <span class="num">{String(i + 1).padStart(2, '0')}</span>
+          <span class="body">
+            <span class="title">{entry.title}</span>
+            {entry.description && <span class="desc">{entry.description}</span>}
+          </span>
+          <span class="side">
+            {entry.tags.slice(0, 2).map((t) => <span class="tag">{t}</span>)}
+            <br />
+            {formatDate(entry.pubDate)}
+          </span>
+          <span class="arrow">→</span>
+        </a>
+      ))}
+    </div>
+  )}
+</BaseLayout>

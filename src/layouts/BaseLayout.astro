@@ -1,0 +1,264 @@
+---
+import '../styles/global.css';
+import { SECTIONS } from '../sections';
+import { SITE } from '../site';
+import { getOverview } from '../lib/content';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const { title = SITE.name, description = '个人文章 · 文章分享 · 八股总结 · 面试汇总 · 个人项目 · 项目分享' } = Astro.props;
+const overview = await getOverview();
+const current = Astro.url.pathname;
+const isActiveSection = (slug: string) => current === `/${slug}/` || current.startsWith(`/${slug}/`);
+const isHome = current === '/';
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content={description} />
+    <title>{title}</title>
+    <script is:inline>
+      // 主题初始化：优先用户手动选择，否则跟随系统（放在 head 里避免闪白）
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div class="shell">
+      <!-- 侧边栏（桌面端） -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-inner">
+          <div class="brand">
+            <div class="brand-mark">{SITE.brand}</div>
+            <div>
+              <div class="brand-name">{SITE.name}</div>
+              <div class="brand-tagline">{SITE.tagline}</div>
+            </div>
+            <button class="theme-toggle" data-theme-toggle title="切换白天/夜晚模式">🌗</button>
+          </div>
+
+          <button class="sidebar-search" data-search-open>🔍 搜索内容…</button>
+
+          <nav>
+            <div class="sidebar-group">
+              <a class={`sidebar-link ${isHome ? 'active' : ''}`} href="/"><span>🏠 首页</span></a>
+              <a class={`sidebar-link ${current.startsWith('/about') ? 'active' : ''}`} href="/about/"><span>👤 关于</span></a>
+            </div>
+
+            <div class="sidebar-group">
+              <p class="sidebar-group-title">内容板块</p>
+              {SECTIONS.map((s) => {
+                const info = overview.find((o) => o.slug === s.slug);
+                const activeArticle = isActiveSection(s.slug) && current !== `/${s.slug}/`;
+                return (
+                  <div class={`nav-group ${isActiveSection(s.slug) ? 'open' : ''}`} data-group={s.slug}>
+                    <div class="nav-row">
+                      <a class={`group-link ${isActiveSection(s.slug) ? 'active' : ''}`} href={`/${s.slug}/`}>
+                        {s.emoji} {s.label}
+                      </a>
+                      <button class="chev" data-group-toggle={s.slug} aria-label="展开/收起">▶</button>
+                    </div>
+                    <ul class="sub-list">
+                      {(info?.latest ?? []).map((e) => (
+                        <li>
+                          <a href={e.href} class={activeArticle && current === e.href ? 'active' : ''} title={e.title}>
+                            {e.title}
+                          </a>
+                        </li>
+                      ))}
+                      {(info?.count ?? 0) > 0 && (
+                        <li><a href={`/${s.slug}/`} style="font-size:.75rem;opacity:.75">查看全部 {info?.count} 篇 →</a></li>
+                      )}
+                    </ul>
+                  </div>
+                );
+              })}
+            </div>
+          </nav>
+        </div>
+        <div class="drag-handle" id="sidebar-resizer" title="拖动调整宽度"></div>
+      </aside>
+
+      <!-- 主内容 -->
+      <div class="main">
+        <header class="topbar">
+          <div class="topbar-brand">
+            <div class="brand-mark">{SITE.brand}</div>
+            <div class="brand-name">{SITE.name}</div>
+          </div>
+          <nav class="topnav">
+            <a href="/" class={isHome ? 'active' : ''}>首页</a>
+            {SECTIONS.map((s) => (
+              <a href={`/${s.slug}/`} class={isActiveSection(s.slug) ? 'active' : ''}>{s.label}</a>
+            ))}
+            <a href="/about/" class={current.startsWith('/about') ? 'active' : ''}>关于</a>
+          </nav>
+          <div style="display:flex;gap:.4rem;align-items:center">
+            <button class="theme-toggle" data-theme-toggle title="切换白天/夜晚模式">🌗</button>
+            <button class="search-btn" data-search-open>🔍 搜索</button>
+          </div>
+        </header>
+
+        <slot />
+
+        <footer class="site-footer">
+          © {new Date().getFullYear()} {SITE.name} · 用 Astro 构建 · 飞书文档一键同步
+        </footer>
+      </div>
+    </div>
+
+    <!-- 搜索弹窗 -->
+    <dialog id="search-dialog" class="search-dialog">
+      <div class="search-head">
+        <span>🔍</span>
+        <input id="search-input" type="search" placeholder="搜索标题、正文或标签…" autocomplete="off" />
+        <button style="border:none;background:none;cursor:pointer;color:var(--subtle);font-size:1.1rem"
+          onclick="document.getElementById('search-dialog').close()">×</button>
+      </div>
+      <div class="search-body" id="search-body">输入关键词开始搜索…</div>
+    </dialog>
+
+    <script>
+      // ===== 白天/夜晚模式切换 =====
+      (function () {
+        function isDark() {
+          return document.documentElement.dataset.theme === 'dark'
+            || (!document.documentElement.dataset.theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        }
+        function applyIcon() {
+          var dark = isDark();
+          document.querySelectorAll('[data-theme-toggle]').forEach(function (btn) {
+            btn.textContent = dark ? '☀️' : '🌙';
+            btn.title = dark ? '切换到白天模式' : '切换到夜晚模式';
+          });
+        }
+        document.querySelectorAll('[data-theme-toggle]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var next = isDark() ? 'light' : 'dark';
+            document.documentElement.dataset.theme = next;
+            try { localStorage.setItem('theme', next); } catch (e) {}
+            applyIcon();
+          });
+        });
+        applyIcon();
+      })();
+
+      // ===== 侧边栏栏目折叠/展开（状态记忆） =====
+      (function () {
+        var KEY = 'expanded-groups';
+        var expanded: Record<string, boolean> = {};
+        try { expanded = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
+        document.querySelectorAll('[data-group-toggle]').forEach(function (btn) {
+          var group = btn.closest('.nav-group') as HTMLElement | null;
+          if (!group) return;
+          var slug = btn.getAttribute('data-group-toggle') as string;
+          // 恢复用户上次的展开偏好
+          if (slug in expanded) group.classList.toggle('open', !!expanded[slug]);
+          btn.addEventListener('click', function () {
+            group.classList.toggle('open');
+            if (group.classList.contains('open')) expanded[slug] = true;
+            else delete expanded[slug];
+            try { localStorage.setItem(KEY, JSON.stringify(expanded)); } catch (e) {}
+          });
+        });
+      })();
+
+      // ===== 侧边栏拖拽调宽 =====
+      (function () {
+        var sidebar = document.getElementById('sidebar');
+        var handle = document.getElementById('sidebar-resizer');
+        if (!sidebar || !handle) return;
+        var saved = localStorage.getItem('sidebar-w');
+        if (saved) { sidebar.style.flexBasis = saved; sidebar.style.width = saved; }
+
+        var startX = 0, startW = 0, dragging = false;
+        function move(x: number) {
+          var w = Math.min(520, Math.max(230, startW + x - startX));
+          sidebar!.style.flexBasis = w + 'px';
+          sidebar!.style.width = w + 'px';
+        }
+        function end() {
+          if (!dragging) return;
+          dragging = false;
+          handle!.classList.remove('active');
+          document.body.style.cursor = '';
+          document.body.style.userSelect = '';
+          localStorage.setItem('sidebar-w', sidebar!.getBoundingClientRect().width + 'px');
+        }
+        handle.addEventListener('mousedown', function (e: MouseEvent) {
+          dragging = true; startX = e.clientX; startW = sidebar!.getBoundingClientRect().width;
+          handle!.classList.add('active');
+          document.body.style.cursor = 'col-resize';
+          document.body.style.userSelect = 'none';
+          e.preventDefault();
+        });
+        window.addEventListener('mousemove', function (e: MouseEvent) { if (dragging) move(e.clientX); });
+        window.addEventListener('mouseup', end);
+        handle.addEventListener('touchstart', function (e: TouchEvent) {
+          dragging = true; startX = e.touches[0].clientX; startW = sidebar!.getBoundingClientRect().width;
+          handle!.classList.add('active');
+        }, { passive: true });
+        window.addEventListener('touchmove', function (e: TouchEvent) { if (dragging) move(e.touches[0].clientX); }, { passive: true });
+        window.addEventListener('touchend', end);
+      })();
+
+      // ===== Pagefind 搜索（npm run build 后自动生成索引；dev 模式下提示先构建） =====
+      (function () {
+        var dialog = document.getElementById('search-dialog') as HTMLDialogElement;
+        var input = document.getElementById('search-input') as HTMLInputElement;
+        var body = document.getElementById('search-body') as HTMLDivElement;
+        if (!dialog || !input || !body) return;
+        var pagefind: any = null;
+        var loading = false;
+        var pendingQuery: string | null = null;
+
+        function runSearch(q: string) {
+          if (!pagefind) { pendingQuery = q; return; }
+          if (!q) { body.textContent = '输入关键词开始搜索…'; return; }
+          pagefind.search(q).then(function (search: any) {
+            Promise.all(search.results.slice(0, 10).map(function (r: any) { return r.data(); })).then(function (results: any[]) {
+              if (results.length === 0) { body.textContent = '没有找到相关内容。'; return; }
+              body.innerHTML = results.map(function (r) {
+                return '<div style="padding:.55rem 0;border-bottom:1px solid var(--border)">'
+                  + '<a href="' + r.url + '" style="font-weight:700">' + (r.meta && r.meta.title || r.url) + '</a>'
+                  + '<div style="font-size:.8rem;color:var(--subtle);margin-top:.2rem">' + (r.excerpt || '').slice(0, 140) + '</div>'
+                  + '</div>';
+              }).join('');
+            });
+          }).catch(function (e: Error) { body.textContent = '搜索出错：' + e.message; });
+        }
+
+        function loadPagefind() {
+          if (pagefind || loading) return;
+          loading = true;
+          body.textContent = '正在加载搜索索引…';
+          var pfUrl = '/pagefind/' + 'pagefind.js';
+          import(pfUrl)
+            .then(function (pf: any) {
+              pagefind = pf; loading = false;
+              body.textContent = '输入关键词开始搜索…';
+              if (pendingQuery) { runSearch(pendingQuery); pendingQuery = null; }
+            })
+            .catch(function () { loading = false; body.textContent = '搜索索引不可用（npm run build 后可用）。'; });
+        }
+
+        document.querySelectorAll('[data-search-open]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            if (typeof dialog.showModal === 'function') dialog.showModal();
+            loadPagefind();
+          });
+        });
+
+        input.addEventListener('input', function () { runSearch(input.value.trim()); });
+      })();
+    </script>
+  </body>
+</html>
