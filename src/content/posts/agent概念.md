@@ -150,9 +150,70 @@ Long-term Memory---这是跨会话、跨任务仍然有价值的信息。
 ### 5.Agent 全链路任务流程图
 
 ```
+用户Query → Workflow任务编排层(区分workflow和agent和llm)
+    ↓
+1.Memory组件（短期对话记忆+长期向量记忆）：读取历史上下文，补充用户历史信息()
+    ↓
+2.RAG检索模块：根据当前问题检索私有知识库，拼接参考文档(rag是从外部知识获取)
+    ↓
+3.Agent决策内核：LLM解析意图→生成思考+工具调用指令
+    ↓【权限拦截层】
+4.Tool工具网关（权限校验+入参校验）→ 合法则调用对应工具（搜索/代码执行/数据库）
+    ↓
+5.工具返回结果 → 回写入Memory
+    ↓
+6.Agent二次整合全部信息（用户输入+记忆+RAG文档+工具返回）生成最终回答
+    ↓
+7.Evaluation评估模块：校验回答合规性、任务完成度、准确性，指标回传优化Workflow
+    ↓
+输出最终结果给用户；评估不合格则回滚至Workflow重新发起一轮迭代
 ```
 
 ### 6.最小agent loop
 
 ```
+# 最小Agent循环：思考→选工具→执行→汇总，单次循环
+class MiniAgent:
+    def __init__(self, llm, memory, tools:dict):
+        self.llm = llm          # 大模型
+        self.memory = memory    # 记忆实例
+        self.tools = tools      # 可用工具字典 {name:func}
+
+    def run(self, user_query:str):
+        # 1.读取历史记忆
+        history = self.memory.load()
+        prompt = f"历史对话:{history}\n用户问题:{user_query}\n需要调用工具则返回【工具名|参数】，无需工具直接返回答案"
+        
+        while True:
+            # 2.大模型思考决策
+            resp = self.llm.generate(prompt)
+            
+            # 分支1：不需要调用工具，直接结束循环
+            if "|" not in resp:
+                final_ans = resp
+                break
+            
+            # 分支2：解析工具调用指令
+            tool_name, params = resp.split("|")
+            # 权限拦截校验
+            if not self._auth_check(tool_name):
+                final_ans = f"无{tool_name}工具使用权限"
+                break
+            
+            # 3.执行工具
+            tool_result = self.tools[tool_name](params)
+            # 工具结果写入记忆，下一轮带入上下文
+            self.memory.save(f"工具{tool_name}执行结果:{tool_result}")
+            # 更新prompt，进入下一轮思考
+            prompt = f"历史:{self.memory.load()}\n基于工具结果重新回答原问题:{user_query}"
+        
+        # 最终结果落库
+        self.memory.save(f"用户:{user_query},回复:{final_ans}")
+        return final_ans
+
+    # 权限拦截函数
+    def _auth_check(self, tool_name):
+        # 白名单权限控制
+        allow_list = ["search", "calc"]
+        return tool_name in allow_list
 ```

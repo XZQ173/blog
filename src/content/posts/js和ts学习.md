@@ -22,6 +22,7 @@ JavaScript是一种运行在浏览器中的解释型的编程语言
 一个合格的开发人员应该精通JavaScript和其他编程语言
 
 ```
+alert('我要学JavaScript!');
 ```
 
 #### 2.快速入门
@@ -49,11 +50,23 @@ JavaScript代码可以直接嵌在网页的任何地方，不过通常我们都�
 **尽量不用 **`var`：旧语法有很多坑（变量污染、作用域混乱），现代项目已废弃。
 
 ```
+const pi=3.14;  #必须在变量声明时就赋值
+let x=1;
+x=2; #后面的变量可以重新赋值
 ```
 
 ###### 2.条件判断if语句
 
 ```
+if (条件) {// 条件为 true 时，执行这里的代码
+}
+
+if (x < y) {
+   z = 4;
+} 
+else {
+   z = 5;
+}
 ```
 
 ###### 3.数据类型和变量
@@ -85,6 +98,22 @@ JavaScript的对象是一组由键-值组成的无序集合,对象的键都是�
 在JavaScript中，使用等号`=`对变量进行赋值。可以把任意数据类型赋值给变量，同一个变量可以反复赋值，而且可以是不同类型的变量，但是要注意只能用`var`申明一次
 
 ```
+const arr = [1, 2, 3.14, 'Hello', null, true];
+arr[0]; // 返回索引为0的元素，即1
+arr[5]; // 返回索引为5的元素，即true
+arr[6]; // 索引超出了范围，返回undefined
+console.log(arr[0], arr[5], arr[6]);
+
+const person = {
+    name: 'Bob',
+    age: 20,
+    tags: ['js', 'web', 'mobile'],
+    city: 'Beijing',
+    hasCar: true,
+    zipcode: null
+};
+person.name; // 'Bob'
+person.zipcode; // null
 ```
 
 启用strict模式的方法是在JavaScript代码的第一行写上：
@@ -92,6 +121,7 @@ JavaScript的对象是一组由键-值组成的无序集合,对象的键都是�
 在strict模式下运行的JavaScript代码，强制通过`var`申明变量，未使用`var`申明变量就使用的，将导致运行错误。
 
 ```
+'use strict';
 ```
 
 ####### 多行字符串
@@ -99,6 +129,9 @@ JavaScript的对象是一组由键-值组成的无序集合,对象的键都是�
 由于多行字符串用`\n`写起来比较费事，所以最新的ES6标准新增了一种多行字符串的表示方法，用反引号\`...\`表示：
 
 ```
+`这是一个
+多行
+字符串`;
 ```
 
 要把多个字符串连接起来，可以用`+`号连接：
@@ -106,11 +139,18 @@ JavaScript的对象是一组由键-值组成的无序集合,对象的键都是�
 如果有很多变量需要连接，用`+`号就比较麻烦。ES6新增了一种模板字符串，表示方法和上面的多行字符串一样，但是它会自动替换字符串中的变量：
 
 ```
+let name = '小明';
+let age = 20;
+let message = `你好, ${name}, 你今年${age}岁了!`;
+alert(message);
 ```
 
 `substring()`返回指定索引区间的子串：
 
 ```
+let s = 'hello, world'
+s.substring(0, 5); // 从索引0开始到5（不包括5），返回'hello'
+s.substring(7); // 从索引7开始到结束，返回'world'
 ```
 
 ####### 数组
@@ -118,36 +158,64 @@ JavaScript的对象是一组由键-值组成的无序集合,对象的键都是�
 `Array`可以通过索引把对应的元素修改为新的值，因此，对`Array`的索引进行赋值会直接修改这个`Array`
 
 ```
+// Array index:
+let arr = ['A', 'B', 'C'];
+arr[1] = 99;
+console.log(arr); // arr现在变为['A', 99, 'C']
+console.log(arr[1]); // 99
 ```
 
 `slice()`就是对应String的`substring()`版本，它截取`Array`的部分元素，然后返回一个新的`Array`：
 
 ```
+let arr = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+arr.slice(0, 3); // 从索引0开始，到索引3结束，但不包括索引3: ['A', 'B', 'C']
+arr.slice(3); // 从索引3开始到结束: ['D', 'E', 'F', 'G']
 ```
 
 `sort()`可以对当前`Array`进行排序，它会直接修改当前`Array`的元素位置，直接调用时，按照默认顺序排序：
 
 ```
+let arr = ['B', 'C', 'A'];
+arr.sort();
+arr; // ['A', 'B', 'C']
 ```
 
 `reverse()`把整个`Array`的元素给调个个，也就是反转：
 
 ```
+let arr = ['one', 'two', 'three'];
+arr.reverse(); 
+arr; // ['three', 'two', 'one']
 ```
 
 `splice()`方法是修改`Array`的“万能方法”，它可以从指定的索引开始删除若干元素，然后再从该位置添加若干元素：
 
 ```
+let arr = ['Microsoft', 'Apple', 'Yahoo', 'AOL', 'Excite', 'Oracle'];
+// 从索引2开始删除3个元素,然后再添加两个元素:
+arr.splice(2, 3, 'Google', 'Facebook'); // 返回删除的元素 ['Yahoo', 'AOL', 'Excite']
+arr; // ['Microsoft', 'Apple', 'Google', 'Facebook', 'Oracle']// 只删除,不添加:
+arr.splice(2, 2); // ['Google', 'Facebook']
+arr; // ['Microsoft', 'Apple', 'Oracle']// 只添加,不删除:
+arr.splice(2, 0, 'Google', 'Facebook'); // 返回[],因为没有删除任何元素
+arr; // ['Microsoft', 'Apple', 'Google', 'Facebook', 'Oracle']
 ```
 
 `concat()`方法把当前的`Array`和另一个`Array`连接起来，并返回一个新的`Array`：
 
 ```
+let arr = ['A', 'B', 'C'];
+let added = arr.concat([1, 2, 3]);
+added; // ['A', 'B', 'C', 1, 2, 3]
+arr; // ['A', 'B', 'C']
 ```
 
 `join()`方法是一个非常实用的方法，它把当前`Array`的每个元素都用指定的字符串连接起来，然后返回连接后的字符串：
 
 ```
+let arr = ['A', 'B', 'C', 1, 2, 3];
+arr.join('-'); // 'A-B-C-1-2-3'
 ```
 
 ####### 对象
@@ -157,6 +225,14 @@ JavaScript的对象是一种无序的集合数据类型，它由若干键值对�
 JavaScript用一个`{...}`表示一个对象，键值对以`xxx: xxx`形式申明，用`,`隔开。注意，最后一个键值对不需要在末尾加`,`，如果加了，有的浏览器（如低版本的IE）将报错。
 
 ```
+let xiaoming = {
+    name: '小明',
+    birth: 1990,
+    school: 'No.1 Middle School',
+    height: 1.70,
+    weight: 65,
+    score: null
+};
 ```
 
 有效变量名  **字母 / 下划线 / **$ 开头 + 字母/数字/下划线/$
@@ -164,11 +240,18 @@ JavaScript用一个`{...}`表示一个对象，键值对以`xxx: xxx`形式申�
 访问属性是通过`.`操作符完成的，但这要求属性名必须是一个有效的变量名。如果属性名包含特殊字符，就必须用`''`括起来：
 
 ```
+let xiaohong = {
+    name: '小红',
+    'middle-school': 'No.1 Middle School'
+};
 ```
 
 `xiaohong`的属性名`middle-school`不是一个有效的变量，就需要用`''`括起来。访问这个属性也无法使用`.`操作符，必须用`['xxx']`来访问：
 
 ```
+xiaohong['middle-school']; // 'No.1 Middle School'
+xiaohong['name']; // '小红'
+xiaohong.name; // '小红'
 ```
 
 如果我们要检测`xiaoming`是否拥有某一属性，可以用`in`操作符.不过要小心，如果`in`判断一个属性存在，这个属性不一定是`xiaoming`的，它可能是`xiaoming`继承得到的：
@@ -176,6 +259,11 @@ JavaScript用一个`{...}`表示一个对象，键值对以`xxx: xxx`形式申�
 要判断一个属性是否是`xiaoming`自身拥有的，而不是继承得到的，可以用`hasOwnProperty()`方法：
 
 ```
+let xiaoming = {
+    name: '小明'
+};
+xiaoming.hasOwnProperty('name'); // true
+xiaoming.hasOwnProperty('toString'); // false
 ```
 
 ####### 条件判断
@@ -183,6 +271,10 @@ JavaScript用一个`{...}`表示一个对象，键值对以`xxx: xxx`形式申�
 JavaScript使用`if () { ... } else { ... }`来进行条件判断。
 
 ```
+let age = 20;
+if (age >= 18) { // 如果age >= 18为true，则执行if语句块console.log('adult');
+} else { // 否则执行else语句块console.log('teenager');
+}
 ```
 
 ####### 循环
@@ -190,6 +282,12 @@ JavaScript使用`if () { ... } else { ... }`来进行条件判断。
 JavaScript的循环有两种，一种是`for`循环，通过初始条件、结束条件和递增条件来循环执行语句块：
 
 ```
+let x = 0;
+let i;
+for (i=1; i<=10000; i++) {
+    x = x + i;
+}
+x; // 50005000
 ```
 
 让我们来分析一下`for`循环的控制条件：
@@ -203,11 +301,23 @@ JavaScript的循环有两种，一种是`for`循环，通过初始条件、结�
 `while`循环只有一个判断条件，条件满足，就不断循环，条件不满足时则退出循环。比如我们要计算100以内所有奇数之和，可以用while循环实现：
 
 ```
+let x = 0;
+let n = 99;
+while (n > 0) {
+    x = x + n;
+    n = n - 2;
+}
+x; // 2500
 ```
 
 最后一种循环是`do { ... } while()`循环，它和`while`循环的唯一区别在于，不是在每次循环开始的时候判断条件，而是在每次循环完成的时候判断条件：
 
 ```
+let n = 0;
+do {
+    n = n + 1;
+} while (n < 100);
+n; // 100
 ```
 
 ####### map和set
@@ -215,9 +325,18 @@ JavaScript的循环有两种，一种是`for`循环，通过初始条件、结�
 `Map`是一组键值对的结构，具有极快的查找速度。
 
 ```
+let m = new Map([['Michael', 95], ['Bob', 75], ['Tracy', 85]]);
+m.get('Michael'); // 95
 ```
 
 ```
+let m = new Map(); // 空Map
+m.set('Adam', 67); // 添加新的key-value
+m.set('Bob', 59);
+m.has('Adam'); // 是否存在key 'Adam': true
+m.get('Adam'); // 67
+m.delete('Adam'); // 删除key 'Adam'
+m.get('Adam'); // undefined
 ```
 
 `Set`和`Map`类似，也是一组key的集合，但不存储value。由于key不能重复，所以，在`Set`中，没有重复的key。
@@ -225,6 +344,7 @@ JavaScript的循环有两种，一种是`for`循环，通过初始条件、结�
 要创建一个`Set`，需要提供一个`Array`作为输入，或者直接创建一个空`Set`：
 
 ```
+let s1 = new Set(); // 空Setlet s2 = new Set([1, 2, 3]); // 含1, 2, 3
 ```
 
 ####### Iterable
@@ -234,11 +354,30 @@ ES6标准引入了新的`iterable`类型，`Array`、`Map`和`Set`都属于`iter
 具有`iterable`类型的集合可以通过新的`for ... of`循环来遍历。
 
 ```
+let a = ['A', 'B', 'C'];
+let s = new Set(['A', 'B', 'C']);
+let m = new Map([[1, 'x'], [2, 'y'], [3, 'z']]);
+for (let x of a) { // 遍历Arrayconsole.log(x);
+}
+for (let x of s) { // 遍历Setconsole.log(x);
+}
+for (let x of m) { // 遍历Mapconsole.log(x[0] + '=' + x[1]);
 ```
 
 更好的方式是直接使用`iterable`内置的`forEach`方法，它接收一个函数，每次迭代就自动回调该函数。以`Array`为例：
 
 ```
+let a = ['A', 'B', 'C'];
+a.forEach(function (element, index, array) {
+    // element: 指向当前元素的值
+    // index: 指向当前索引
+    // array: 指向Array对象本身
+    console.log(`${element}, index = ${index}`);
+});
+
+A, index = 0
+B, index = 1
+C, index = 2
 ```
 
 #### 3.函数
@@ -248,6 +387,13 @@ ES6标准引入了新的`iterable`类型，`Array`、`Map`和`Set`都属于`iter
 在JavaScript中，定义函数的方式如下：
 
 ```
+function abs(x) {
+    if (x >= 0) {
+        return x;
+    } else {
+        return -x;
+    }
+}
 ```
 
 上述`abs()`函数的定义如下：
@@ -263,6 +409,13 @@ ES6标准引入了新的`iterable`类型，`Array`、`Map`和`Set`都属于`iter
 第二种定义函数的方式如下：
 
 ```
+let abs = function (x) {
+    if (x >= 0) {
+        return x;
+    } else {
+        return -x;
+    }
+};#注意加;表示赋值结束
 ```
 
 调用函数时，按顺序传入参数即可
@@ -270,6 +423,15 @@ ES6标准引入了新的`iterable`类型，`Array`、`Map`和`Set`都属于`iter
 rest参数只能写在最后，前面用`...`标识，从运行结果可知，传入的参数先绑定`a`、`b`，多余的参数以数组形式交给变量`rest`
 
 ```
+function foo(a, b, ...rest) {
+    console.log('a = ' + a);
+    console.log('b = ' + b);
+    console.log(rest);
+}
+
+foo(1, 2, 3, 4, 5);
+// 结果:// a = 1// b = 2// Array [ 3, 4, 5 ]foo(1);
+// 结果:// a = 1// b = undefined// Array []
 ```
 
 ##### 2.变量作用域与解构赋值
@@ -287,6 +449,17 @@ JavaScript的函数在查找变量时从自身函数定义开始，从“内”�
 在一个对象中绑定函数，称为这个对象的方法。
 
 ```
+let xiaoming = {
+    name: '小明',
+    birth: 1990,
+    age: function () {
+        let y = new Date().getFullYear();
+        return y - this.birth;
+    }
+};
+
+xiaoming.age; // function xiaoming.age()
+xiaoming.age(); // 今年调用是25,明年调用就变成26了
 ```
 
 在一个方法内部，`this`是一个特殊变量，它始终指向当前对象，也就是`xiaoming`这个变量。所`this.birth`可以拿到`xiaoming`的`birth`属性。
@@ -294,6 +467,19 @@ JavaScript的函数在查找变量时从自身函数定义开始，从“内”�
 要指定函数的`this`指向哪个对象，可以用函数本身的`apply`方法，它接收两个参数，第一个参数就是需要绑定的`this`变量，第二个参数是`Array`，表示函数本身的参数。用`apply`修复`getAge()`调用：
 
 ```
+function getAge() {
+    let y = new Date().getFullYear();
+    return y - this.birth;
+}
+
+let xiaoming = {
+    name: '小明',
+    birth: 1990,
+    age: getAge
+};
+
+xiaoming.age(); // 25
+getAge.apply(xiaoming, []); // 25, this指向xiaoming, 参数为空
 ```
 
 另一个与`apply()`类似的方法是`call()`，唯一区别是：
@@ -305,6 +491,8 @@ JavaScript的函数在查找变量时从自身函数定义开始，从“内”�
 比如调用`Math.max(3, 5, 4)`，分别用`apply()`和`call()`实现如下：
 
 ```
+Math.max.apply(null, [3, 5, 4]); // 5
+Math.max.call(null, 3, 5, 4); // 5
 ```
 
 ###### 装饰器
@@ -312,6 +500,21 @@ JavaScript的函数在查找变量时从自身函数定义开始，从“内”�
 利用`apply()`，我们还可以动态改变函数的行为。
 
 ```
+'use strict';
+
+let count = 0;
+let oldParseInt = parseInt; // 保存原函数
+
+window.parseInt = function () {
+    count += 1;
+    return oldParseInt.apply(null, arguments); // 调用原函数
+};
+
+// 测试:
+parseInt('10');
+parseInt('20');
+parseInt('30');
+console.log('count = ' + count); // 3
 ```
 
 ##### 4.高阶函数
@@ -321,6 +524,9 @@ JavaScript的函数其实都指向某个变量。既然变量可以指向函数�
 一个最简单的高阶函数：
 
 ```
+function add(x, y, f) {
+    return f(x) + f(y);
+}
 ```
 
 Map
@@ -340,11 +546,15 @@ Every() find findIndex forEach
 为什么叫箭头函数？因为它的定义用的就是一个箭头：
 
 ```
+x => x * x
 ```
 
 上面的箭头函数相当于：
 
 ```
+function (x) {
+    return x * x;
+}
 ```
 
 ##### 7.标签函数
@@ -354,6 +564,11 @@ Every() find findIndex forEach
 generator跟函数很像，定义如下：
 
 ```
+function* foo(x) {
+    yield x + 1;
+    yield x + 2;
+    return x + 3;
+}
 ```
 
 generator和函数不同的是，generator由`function*`定义（注意多出的`*`号），并且，除了`return`语句，还可以用`yield`返回多次。
@@ -367,6 +582,9 @@ generator和函数不同的是，generator由`function*`定义（注意多出的
 包装对象用`new`创建：
 
 ```
+let n = new Number(123); // 123,生成了新的包装类型
+let b = new Boolean(true); // true,生成了新的包装类型
+let s = new String('str'); // 'str',生成了新的包装类型
 ```
 
 虽然包装对象看上去和原来的值一模一样，显示出来也是一模一样，但他们的类型已经变为`object`了！
@@ -418,11 +636,20 @@ JavaScript有两种方式创建一个正则表达式：
 两种写法是一样的：
 
 ```
+let re1 = /ABC\-001/;
+let re2 = new RegExp('ABC\\-001');
+
+re1; // /ABC\-001/
+re2; // /ABC\-001/
 ```
 
 先看看如何判断正则表达式是否匹配：
 
 ```
+let re = /^\d{3}\-\d{3,8}$/;
+re.test('010-12345'); // true
+re.test('010-1234x'); // false
+re.test('010 12345'); // false
 ```
 
 RegExp对象的`test()`方法用于测试给定的字符串是否符合条件。
@@ -432,11 +659,16 @@ RegExp对象的`test()`方法用于测试给定的字符串是否符合条件。
 `^(\d{3})-(\d{3,8})$`分别定义了两个组，可以直接从匹配的字符串中提取出区号和本地号码：
 
 ```
+let re = /^(\d{3})-(\d{3,8})$/;
+re.exec('010-12345'); // ['010-12345', '010', '12345']
+re.exec('010 12345'); // null
 ```
 
 JavaScript的正则表达式还有几个特殊的标志，最常用的是`g`，表示全局匹配：
 
 ```
+let r1 = /test/g;
+// 等价于:let r2 = new RegExp('test', 'g');
 ```
 
 ###### Json
@@ -464,6 +696,7 @@ JSON是JavaScript Object Notation的缩写，它是一种数据交换格式。
 第二个参数用于控制如何筛选对象的键值，如果我们只想输出指定的属性，可以传入`Array`：
 
 ```
+JSON.stringify(xiaoming, ['name', 'skills'], '  ');
 ```
 
 拿到一个JSON格式的字符串，我们直接用`JSON.parse()`把它变成一个JavaScript对象：
@@ -483,6 +716,13 @@ JavaScript的面向对象编程和大多数其他语言如Java、C#的面向对�
 原型是指当我们想要创建`xiaoming`这个具体的学生时，我们并没有一个`Student`类型可用。那怎么办？恰好有这么一个现成的对象：
 
 ```
+let robot = {
+    name: 'Robot',
+    height: 1.6,
+    run: function () {
+        console.log(this.name + ' is running...');
+    }
+};
 ```
 
 我们看这个`robot`对象有名字，有身高，还会跑，有点像小明，干脆就根据它来“创建”小明得了！
@@ -490,11 +730,26 @@ JavaScript的面向对象编程和大多数其他语言如Java、C#的面向对�
 于是我们把它改名为`Student`，然后创建出`xiaoming`：
 
 ```
+let Student = {
+    name: 'Robot',
+    height: 1.2,
+    run: function () {
+        console.log(this.name + ' is running...');
+    }
+};
+
+let xiaoming = {
+    name: '小明'
+};
+
+xiaoming.__proto__ = Student;
 ```
 
 注意最后一行代码把`xiaoming`的原型指向了对象`Student`，看上去`xiaoming`仿佛是从`Student`继承下来的：
 
 ```
+xiaoming.name; // '小明'
+xiaoming.run(); // 小明 is running...
 ```
 
 当我们用`obj.xxx`访问一个对象的属性时，JavaScript引擎先在当前对象上查找该属性，如果没有找到，就到其原型对象上找，如果还没有找到，就一直上溯到`Object.prototype`对象，最后，如果还没有找到，就只能返回`undefined`。
@@ -502,6 +757,12 @@ JavaScript的面向对象编程和大多数其他语言如Java、C#的面向对�
 除了直接用`{ ... }`创建一个对象外，JavaScript还可以用一种构造函数的方法来创建对象。它的用法是，先定义一个构造函数：
 
 ```
+function Student(name) {
+    this.name = name;
+    this.hello = function () {
+        alert('Hello, ' + this.name + '!');
+    }
+}
 ```
 
 你会问，咦，这不是一个普通函数吗？
@@ -509,6 +770,9 @@ JavaScript的面向对象编程和大多数其他语言如Java、C#的面向对�
 这确实是一个普通函数，但是在JavaScript中，可以用关键字`new`来调用这个函数，并返回一个对象：
 
 ```
+let xiaoming = new Student('小明');
+xiaoming.name; // '小明'
+xiaoming.hello(); // Hello, 小明!
 ```
 
 *注意*，如果不写`new`，这就是一个普通函数，它返回`undefined`。但是，如果写了`new`，它就变成了一个构造函数，它绑定的`this`指向新创建的对象，并默认返回`this`，也就是说，不需要在最后写`return this;`。
@@ -522,6 +786,17 @@ JavaScript的面向对象编程和大多数其他语言如Java、C#的面向对�
 使用try ... catch ... finally处理错误时，我们编写的代码如下
 
 ```
+let r1, r2, s = null;
+try {
+    r1 = s.length; // 此处应产生错误
+    r2 = 100; // 该语句不会执行
+} catch (e) {
+    console.log('出错了：' + e);
+} finally {
+    console.log('finally');
+}
+console.log('r1 = ' + r1); // r1应为undefined
+console.log('r2 = ' + r2); // r2应为undefined
 ```
 
 所以，有错误发生时，执行流程像这样：
@@ -551,6 +826,15 @@ npm是什么东西？npm其实是Node.js的包管理工具（package manager）�
 我们把`hello.js`改造一下，创建一个函数，这样我们就可以在其他地方调用这个函数：
 
 ```
+'use strict';
+
+const s = 'Hello';
+
+function greet(name) {
+    console.log(s + ', ' + name + '!');
+}
+
+module.exports = greet;
 ```
 
 函数`greet()`是我们在`hello`模块中定义的，你可能注意到最后一行是一个奇怪的赋值语句，它的意思是，把函数`greet`作为模块的输出暴露出去，这样其他模块就可以使用`greet`函数了。
@@ -558,6 +842,7 @@ npm是什么东西？npm其实是Node.js的包管理工具（package manager）�
 要在模块中对外输出变量，用：
 
 ```
+module.exports = variable;
 ```
 
 输出的变量可以是任意对象、函数、数组等等。
@@ -565,6 +850,7 @@ npm是什么东西？npm其实是Node.js的包管理工具（package manager）�
 要引入其他模块输出的对象，用：
 
 ```
+const foo = require('other_module');
 ```
 
 引入的对象具体是什么，取决于引入模块输出的对象。
@@ -576,11 +862,15 @@ Node内置了许多模块，可以从Node.js的[在线文档](https://nodejs.org
 方法一：使用传统的`require()`：
 
 ```
+const { randomInt } = require('node:crypto');
+const n = randomInt(0, 100); // 0~100之间的随机数console.log(n);
 ```
 
 方法二：使用`import`关键字导入ESM模块：
 
 ```
+import { randomInt } from 'node:crypto';
+const n = randomInt(0, 100); // 0~100之间的随机数console.log(n);
 ```
 
 #### 10.web开发
@@ -606,16 +896,26 @@ Const
 数组
 
 ```
+let [a, b, c] = [1, 2, 3];
 ```
 
 对象
 
 ```
+let { foo, bar } = { foo: 'aaa', bar: 'bbb' };
+foo // "aaa"
+bar // "bbb"
 ```
 
 字符串
 
 ```
+const [a, b, c, d, e] = 'hello';
+a // "h"
+b // "e"
+c // "l"
+d // "l"
+e // "o"
 ```
 
 ## 2.ts学习
@@ -633,11 +933,15 @@ TypeScript 是静态类型
 动态类型是指在运行时才会进行类型检查，这种语言的类型错误往往会导致运行时错误。JavaScript 是一门解释型语言([4])，没有编译阶段，所以它是动态类型，以下这段代码在运行时才会报错：
 
 ```
+let foo = 1;
+foo.split(' ');// Uncaught TypeError: foo.split is not a function// 运行时会报错（foo.split 不是一个函数），造成线上 bug
 ```
 
 静态类型是指编译阶段就能确定每个变量的类型，这种语言的类型错误往往会导致语法错误。TypeScript 在运行前需要先编译为 JavaScript，而在编译阶段就会进行类型检查，所以 TypeScript 是静态类型，这段 TypeScript 代码在编译阶段就会报错了：
 
 ```
+let foo = 1;
+foo.split(' ');// Property 'split' does not exist on type 'number'.// 编译时会报错（数字没有 split 方法），无法通过编译
 ```
 
 TypeScript 非常适用于大型项目——这是显而易见的，类型系统可以为大型项目带来更高的可维护性，以及更少的 bug。
@@ -669,14 +973,32 @@ TypeScript 非常适用于大型项目——这是显而易见的，类型系统
 布尔值是最基础的数据类型，在 TypeScript 中，使用 `boolean` 定义布尔值类型：
 
 ```
+let isDone: boolean = false;
+// 编译通过
+// 后面约定，未强调编译错误的代码片段，默认为编译通过
 ```
 
 数值  使用 `number` 定义数值类型：
 
 ```
+let decLiteral: number = 6;let hexLiteral: number = 0xf00d;
+// ES6 中的二进制表示法
+let binaryLiteral: number = 0b1010;
+// ES6 中的八进制表示法
+let octalLiteral: number = 0o744;
+let notANumber: number = NaN;
+let infinityNumber: number = Infinity;
 ```
 
 编译结果：
 
 ```
+var decLiteral = 6;
+var hexLiteral = 0xf00d;
+// ES6 中的二进制表示法
+var binaryLiteral = 10;
+// ES6 中的八进制表示法
+var octalLiteral = 484;
+var notANumber = NaN;
+var infinityNumber = Infinity;
 ```

@@ -19,23 +19,69 @@ export async function getStaticPaths() {
 }
 
 const { entry, sectionMeta } = Astro.props;
-const { Content } = await render(entry);
+const { Content, headings } = await render(entry);
+const toc = (headings || []).filter((h: any) => h.depth >= 2 && h.depth <= 4);
 const { title, pubDate, tags, description, link } = entry.data;
 ---
 
 <BaseLayout title={`${title} · ${sectionMeta.label} · ${SITE.name}`} description={description}>
   <p class="breadcrumb"><a href="/">知识库</a> › <a href={`/${sectionMeta.slug}/`}>{sectionMeta.label}</a> › 正文</p>
 
-  <article class="prose">
-    <span class="section-chip">{sectionMeta.emoji} {sectionMeta.label}</span>
-    <h1 style="margin-top:.8rem">{title}</h1>
-    <div class="post-meta">
-      <time datetime={pubDate.toISOString()}>{formatDate(pubDate)}</time>
-      {tags.map((t: string) => <span class="tag">{t}</span>)}
-      {link && <a href={link} target="_blank" rel="noopener noreferrer">原文链接 ↗</a>}
-    </div>
-    <Content />
-  </article>
+  <div class="article-layout">
+    <article class="prose">
+      <span class="section-chip">{sectionMeta.emoji} {sectionMeta.label}</span>
+      <h1 style="margin-top:.8rem">{title}</h1>
+      <div class="post-meta">
+        <time datetime={pubDate.toISOString()}>{formatDate(pubDate)}</time>
+        {tags.map((t: string) => <span class="tag">{t}</span>)}
+        {link && <a href={link} target="_blank" rel="noopener noreferrer">原文链接 ↗</a>}
+      </div>
+      <Content />
+    </article>
+
+    {toc.length > 0 && (
+      <aside class="toc" id="toc" aria-label="文章目录">
+        <p class="toc-title">📑 目录</p>
+        <nav class="toc-nav">
+          {toc.map((h: any) => (
+            <a class={`toc-item toc-h${h.depth}`} href={`#${h.slug}`} data-toc-link={h.slug}>{h.text}</a>
+          ))}
+        </nav>
+      </aside>
+    )}
+  </div>
 
   <p style="margin-top:3rem"><a class="backlink" href={`/${sectionMeta.slug}/`}>‹ 返回{sectionMeta.label}</a></p>
 </BaseLayout>
+
+<script>
+  // 目录：平滑滚动 + 滚动高亮当前小节
+  (function () {
+    var toc = document.getElementById('toc');
+    if (!toc) return;
+    var links = Array.from(document.querySelectorAll('[data-toc-link]')) as HTMLAnchorElement[];
+    links.forEach(function (l) {
+      l.addEventListener('click', function (e: MouseEvent) {
+        e.preventDefault();
+        var target = document.getElementById(l.getAttribute('data-toc-link') || '');
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    });
+    var map = new Map<string, HTMLAnchorElement>();
+    links.forEach(function (l) {
+      var id = l.getAttribute('data-toc-link') || '';
+      var el = document.getElementById(id);
+      if (el) map.set(id, l);
+    });
+    function spy() {
+      var current = '';
+      map.forEach(function (_l, id) {
+        var el = document.getElementById(id);
+        if (el && el.getBoundingClientRect().top <= 90) current = id;
+      });
+      links.forEach(function (l) { l.classList.toggle('active', l.getAttribute('data-toc-link') === current); });
+    }
+    window.addEventListener('scroll', spy, { passive: true });
+    spy();
+  })();
+</script>

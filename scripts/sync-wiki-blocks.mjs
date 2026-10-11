@@ -112,13 +112,9 @@ function mdConverter(blocks, docToken, nodeToken, imgMap, stats) {
       case 13: break;
       case 14: {
         const lang = LANG[b.code?.language] || '';
-        const lines = (b.children || []).map(cid => {
-          const cb = byId[cid];
-          return cb ? renderElements(cb.text?.elements, { raw: true }) : '';
-        });
-        out.push('```' + lang);
-        out.push(...lines);
-        out.push('```');
+        const text = (b.code?.elements || []).map(el => (el.text_run ? el.text_run.content : '')).join('');
+        const codeLines = text.replace(/\n+$/, '').split('\n');
+        out.push('```' + lang, ...codeLines, '```');
         stats.codeBlocks++;
         break;
       }

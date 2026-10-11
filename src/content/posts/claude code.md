@@ -24,6 +24,63 @@ tags: [飞书同步]
 下面只是一个最小的循环
 
 ```
+import anthropic
+client = anthropic.Anthropic()
+MODEL = "claude-opus-4-6"
+
+SYSTEM = "你是一个 Coding Agent，可以执行 bash 命令来完成任务。"
+
+TOOLS = [{
+    "name": "bash",
+    "description": "执行 shell 命令，返回输出",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "要执行的 shell 命令"}
+        },
+        "required": ["command"]
+    }
+}]
+
+import subprocess
+
+def run_bash(command: str) -> str:
+    result = subprocess.run(
+        command, shell=True, capture_output=True, text=True, timeout=30
+    )
+    return result.stdout + result.stderr
+
+def agent_loop(query: str):
+    messages = [{"role": "user", "content": query}]
+
+    while True:
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM,
+            messages=messages, tools=TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 没有工具调用 → 结束if response.stop_reason != "tool_use":
+            for block in response.content:
+                if hasattr(block, "text"):
+                    print(block.text)
+            return# 执行所有工具调用，收集结果
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = run_bash(block.input["command"])
+                print(f"[bash] {block.input['command']}")
+                print(f"  → {output[:200]}")
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                })
+        messages.append({"role": "user", "content": results})
+
+if __name__ == "__main__":
+    query = input("You: ").strip()
+    agent_loop(query)
 ```
 
 ### 1.关键设计解析
@@ -35,6 +92,16 @@ tags: [飞书同步]
 即滚雪球式的对话记忆.
 
 ```
+# 轮次 1：用户消息
+messages = [{"role": "user", "content": "列出当前目录的 Python 文件"}]
+
+# 轮次 1：LLM 响应（包含 tool_use block）
+messages.append({"role": "assistant", "content": response.content})
+
+# 轮次 1：工具结果
+messages.append({"role": "user", "content": [tool_result]})
+
+# 轮次 2：LLM 继续推理...
 ```
 
 #### stop_reason 是唯一的退出条件
@@ -44,6 +111,15 @@ tags: [飞书同步]
 工具结果必须以 `role: "user"` 消息的形式返回，且 content 是一个列表：
 
 ```
+{
+    "role": "user",
+    "content": [
+        {
+            "type": "tool_result",
+            "tool_use_id": block.id,  # 必须和 tool_use 的 id 匹配"content": "命令输出..."
+        }
+    ]
+}
 ```
 
 ### 2.源码
@@ -57,6 +133,16 @@ Claude Code 把 Agent Loop 拆成两层：
 `QueryEngine` 的核心字段直接映射了我们教学实现中的 `messages` 列表：
 
 ```
+// src/QueryEngine.ts
+export class QueryEngine {
+  private mutableMessages: Message[]      
+  // ← 对应我们的 messages = []
+  private abortController: AbortController // ← 我们没有：取消信号--会话中断能力
+  private readFileState: FileStateCache    // ← 我们没有：文件读取缓存--避免重复读取文件
+  private totalUsage: NonNullableUsage     // ← 我们没有：token 用量追踪--累计输入输出token
+  private permissionDenials: SDKPermissionDenial[]
+  // ...
+}
 ```
 
 queryLoop 的状态机
@@ -64,6 +150,18 @@ queryLoop 的状态机
 我们的 `while True` 里只有一个判断：`stop_reason != "tool_use"` 就退出。而真实的 `queryLoop` 在每次迭代中携带一个 `State` 对象，跟踪压缩状态、恢复计数和 stop hook：
 
 ```
+// src/query.ts — 循环状态type State = {
+  messages: Message[]
+  toolUseContext: ToolUseContext
+  autoCompactTracking: AutoCompactTrackingState | undefined
+  maxOutputTokensRecoveryCount: number
+  hasAttemptedReactiveCompact: boolean
+  maxOutputTokensOverride: number | undefined
+  pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
+  stopHookActive: boolean | undefined
+  turnCount: number
+  transition: Continue | undefined  // ← 上一轮为什么 continue 了
+}
 ```
 
 messages 当前轮次完整对话上下文，来自上层 `QueryEngine`，包含用户、模型、工具交互记录。
@@ -99,6 +197,13 @@ transition 流转标记，记录上一轮循环没有退出、继续执行的原
 这是最精妙的部分。当对话变得太长，API 返回 prompt-too-long 错误时，Claude Code 有一条三级恢复链：
 
 ```
+prompt_too_long
+    ↓
+[1] context collapse — 折叠已暂存的历史摘要（轻量）
+    ↓ 还是太长？
+[2] reactive compact — 对整段对话做激进压缩（重量）
+    ↓ 还是太长？
+[3] 返回 { reason: 'prompt_too_long' } 终止
 ```
 
 #### 3.max_output_tokens 恢复链
@@ -114,6 +219,14 @@ transition 流转标记，记录上一轮循环没有退出、继续执行的原
 ### 4.这 30 行代码做了什么
 
 ```
+用户输入
+   ↓
+messages = [user_message]
+   ↓
+while True:
+    LLM 调用 → 追加 assistant 响应
+    if stop_reason != "tool_use": break
+    执行每个工具调用 → 追加 tool_result
 ```
 
 仅此而已。没有魔法，没有框架，没有隐藏逻辑。
@@ -121,6 +234,12 @@ transition 流转标记，记录上一轮循环没有退出、继续执行的原
 而 Claude Code 在这个骨架上加了一层状态机外壳：
 
 ```
+while (true):
+    API 调用 → 流式处理 → 追加消息
+    if prompt_too_long → collapse → reactive compact → 终止
+    if max_output_tokens → 升级 8k→64k → 多轮恢复 → 终止
+    if stop_hook 失败 → 注入错误重试
+    if 有工具调用 → 执行 → state.transition = next_turn → continuereturn { reason: 'completed' }
 ```
 
 ## 2.tool use:拓展模型能触达的边界
@@ -148,11 +267,34 @@ transition 流转标记，记录上一轮循环没有退出、继续执行的原
 01的工具执行是硬编码的：
 
 ```
+# s01：硬编码，每加一个工具就要改循环
+if block.name == "bash":
+    output = run_bash(block.input["command"])
 ```
 
 02换成 dispatch map：
 
 ```
+#字典查找，加工具只加 handler
+TOOL_HANDLERS = {
+    "bash":       lambda **kw: run_bash(kw["command"]),    
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),}
+# 循环中：一行查找替代 if/elif 链
+handler = TOOL_HANDLERS.get(block.name)
+output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+
+#lambda 匿名函数
+#**kw 关键字参数解包、字典字面量 {key: value}、dict.get()、三元表达式 A if cond else B
+"""
+这是工具路由分发器：根据工具名称（bash/read_file/write_file/edit_file）自动匹配
+对应的执行函数，替代传统一长串if/elif判断，可读性、扩展性更强
+键"bash"对应匿名 lambda 函数： 
+**kw：接收调用时传入的所有关键字参数，打包成字典kw
+执行run_bash函数，从参数字典取出command命令传给它 
+例：传入command="ls -l"，等价调用run_bash(command="ls -l")
+"""
 ```
 
 循环体本身和01 完全一样，只是工具执行那行变成了字典查找。
@@ -166,6 +308,36 @@ transition 流转标记，记录上一轮循环没有退出、继续执行的原
 Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——这就是它的 “dispatch map”。核心工具直接注册，实验性工具通过 feature flag 条件注册：
 
 ```
+// src/tools.ts — 工具注册表（简化）
+export function getAllBaseTools(): Tools {
+  return [
+    AgentTool,
+    TaskOutputTool,
+    BashTool,
+    // 内嵌搜索工具时跳过 Glob/Grep
+    ...(hasEmbeddedSearchTools() ? [] : [GlobTool, GrepTool]),
+    FileReadTool,
+    FileEditTool,
+    FileWriteTool,
+    NotebookEditTool,
+    WebFetchTool,
+    TodoWriteTool,
+    WebSearchTool,
+    SkillTool,
+    AskUserQuestionTool,
+    EnterPlanModeTool,
+    ExitPlanModeV2Tool,
+    // feature flag 条件注册
+    ...(SleepTool ? [SleepTool] : []),
+    ...cronTools,  // CronCreate, CronDelete, CronList
+    ...(isWorktreeModeEnabled()
+      ? [EnterWorktreeTool, ExitWorktreeTool] : []),
+    ...(isTodoV2Enabled()
+      ? [TaskCreateTool, TaskGetTool, TaskUpdateTool, TaskListTool] : []),
+    ...(isToolSearchEnabledOptimistic() ? [ToolSearchTool] : []),
+    // ... 共计 ~40 个工具
+  ]
+}
 ```
 
 关键设计：数组展开 + 条件三元运算符。`feature('PROACTIVE')` 返回 `true` 时 `SleepTool` 才会进入数组；`process.env.USER_TYPE === 'ant'` 控制 Anthropic 内部工具。这让同一个二进制产物能服务不同用户群。
@@ -179,11 +351,34 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 每个工具都实现 `Tool<Input, Output, Progress>` 类型：
 
 ```
+// src/Tool.ts — 核心类型（简化）
+export type Tool<Input, Output, P> = {
+  readonly name: string
+  readonly inputSchema: Input           // Zod schemacall(
+    args: z.infer<Input>,
+    context: ToolUseContext,
+    canUseTool: CanUseToolFn,
+    parentMessage: AssistantMessage,
+    onProgress?: ToolCallProgress<P>,
+  ): Promise<ToolResult<Output>>
+  description(input, options): Promise<string>
+  isEnabled(): boolean                  // 是否在当前环境可用
+  isReadOnly(input): boolean            // 只读操作？
+  isDestructive?(input): boolean        // 不可逆操作？
+  isConcurrencySafe(input): boolean     // 可并发执行？
+  maxResultSizeChars: number            // 结果超限时持久化到磁盘
+  readonly shouldDefer?: boolean        // 延迟加载（需 ToolSearch 发现）
+}
 ```
 
 #### 工具返回值：`ToolResult<T>`
 
 ```
+export type ToolResult<T> = {
+  data: T                    // 工具输出内容
+  newMessages?: Message[]    // 可选：注入额外消息到上下文
+  contextModifier?: (ctx: ToolUseContext) => ToolUseContext  // 可选：修改后续上下文
+}
 ```
 
 `data` 是返回给 LLM 的主体内容。`newMessages` 让工具可以向消息历史注入系统提示。`contextModifier` 让工具（如 `EnterPlanModeTool`）可以改变后续循环的行为。
@@ -191,6 +386,22 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 ##### ToolUseContext：工具运行时上下文
 
 ```
+export type ToolUseContext = {
+  messages: Message[]               // 完整对话历史
+  abortController: AbortController  // 中断控制
+  getAppState(): AppState           // 读全局状态
+  setAppState(f): void              // 写全局状态
+  queryTracking?: QueryChainTracking  // 查询链追踪
+  options: {
+    tools: Tools                    // 可用工具列表
+    mcpClients: MCPServerConnection[]
+    mainLoopModel: string// ...
+  }
+}
+export type QueryChainTracking = {
+  chainId: string   // 同一轮对话的链 ID
+  depth: number     // 嵌套深度（Agent 中的 Agent）
+}
 ```
 
 ##### 权限模型：`ToolPermissionContext`
@@ -198,6 +409,15 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 每次工具调用前都经过权限检查：
 
 ```
+export type ToolPermissionContext = DeepImmutable<{
+  mode: PermissionMode                    // 'default' | 'plan' | 'bypass'
+  alwaysAllowRules: ToolPermissionRulesBySource   // 始终允许
+  alwaysDenyRules: ToolPermissionRulesBySource     // 始终拒绝
+  alwaysAskRules: ToolPermissionRulesBySource      // 始终询问
+  additionalWorkingDirectories: Map<string, AdditionalWorkingDirectory>
+  isBypassPermissionsModeAvailable: boolean
+  shouldAvoidPermissionPrompts?: boolean  // 后台 Agent 自动拒绝
+}>
 ```
 
 权限检查的结果是三选一：allow（直接执行）、deny（拒绝并返回错误）、ask（弹出对话框请求用户授权）。工具还通过 `isReadOnly()` 和 `isDestructive()` 标记自身的危险等级，`filterToolsByDenyRules()` 在工具列表发送给模型之前就过滤掉被禁止的工具。
@@ -205,6 +425,16 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 ### 4.路径沙箱
 
 ```
+from pathlib import Path
+
+WORKDIR = Path(".").resolve()
+
+def safe_path(p: str) -> Path:
+    """防止路径逃逸工作区"""
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
 ```
 
 所有文件操作都通过 `safe_path()` 验证，模型无法读写工作区外的文件。
@@ -214,6 +444,33 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 ### 5.四个工具的实现
 
 ```
+import subprocess
+from pathlib import Path
+
+def run_bash(command: str) -> str:
+    result = subprocess.run(
+        command, shell=True, capture_output=True, text=True, timeout=30
+    )
+    return (result.stdout + result.stderr)[:50000]
+
+def run_read(path: str, limit: int = None) -> str:
+    text = safe_path(path).read_text()
+    lines = text.splitlines()
+    if limit and limit < len(lines):
+        lines = lines[:limit]
+    return "\n".join(lines)[:50000]
+
+def run_write(path: str, content: str) -> str:
+    p = safe_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return f"Written: {path}"def run_edit(path: str, old_text: str, new_text: str) -> str:
+    p = safe_path(path)
+    content = p.read_text()
+    if old_text not in content:
+        return f"Error: old_text not found in {path}"
+    p.write_text(content.replace(old_text, new_text, 1))
+    return f"Edited: {path}"
 ```
 
 ### 6.工具 Schema
@@ -221,6 +478,54 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 每个工具需要一个 schema 告诉 LLM 怎么调用：
 
 ```
+TOOLS = [
+    {
+        "name": "bash",
+        "description": "执行 shell 命令",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "read_file",
+        "description": "读取文件内容，支持 limit 参数限制行数",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": "integer", "description": "最多读取的行数（可选）"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "写入文件，自动创建父目录",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "edit_file",
+        "description": "精确查找替换文件中的内容",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string", "description": "要替换的原文本"},
+                "new_text": {"type": "string", "description": "替换后的新文本"}
+            },
+            "required": ["path", "old_text", "new_text"]
+        }
+    }
+]
 ```
 
 在 Claude Code 中，schema 使用 Zod 定义（`inputSchema` 字段），运行时自动转换为 JSON Schema 发送给 API。每个工具还有动态 `description()` 方法，可以根据当前权限上下文生成不同的描述文本。
@@ -232,6 +537,11 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 #### 为什么 edit_file 比 bash sed 更好
 
 ```
+# bash sed：遇到特殊字符（/、&、\n）就崩
+sed -i 's/old_text/new_text/' file.py
+
+# edit_file：Python 字符串替换，无特殊字符问题
+run_edit("file.py", old_text="def foo():", new_text="def bar():")
 ```
 
 `edit_file` 还有一个额外好处：如果 `old_text` 不存在，会返回明确的错误信息，而不是静默成功（sed 的常见陷阱）。
@@ -261,6 +571,43 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 #### Python 实现
 
 ```
+from dataclasses import dataclass, field
+from typing import List, Literalimport json
+
+Status = Literal["pending", "in_progress", "completed"]
+
+@dataclassclass TodoItem:
+    id: str
+    content: str
+    status: Status = "pending"class TodoManager:
+    def __init__(self):
+        self.todos: List[TodoItem] = []
+        self._rounds_since_update = 0def add(self, content: str) -> str:
+        item = TodoItem(id=str(len(self.todos) + 1), content=content)
+        self.todos.append(item)
+        return item.iddef update(self, todo_id: str, status: Status):
+        for item in self.todos:
+            if item.id == todo_id:
+                # 同时只能有一个 in_progressif status == "in_progress":
+                    for other in self.todos:
+                        if other.status == "in_progress":
+                            other.status = "pending"
+                item.status = status
+                self._rounds_since_update = 0return f"Updated {todo_id} → {status}"return f"Todo {todo_id} not found"def view(self) -> str:
+        if not self.todos:
+            return "No todos."
+        lines = []
+        for item in self.todos:
+            icon = {"pending": "○", "in_progress": "◐", "completed": "●"}[item.status]
+            lines.append(f"{icon} [{item.id}] {item.content}")
+        return "\n".join(lines)
+
+    def attention_check(self) -> str | None:
+        """3 轮没有更新 todo → 注入提醒"""
+        self._rounds_since_update += 1if self._rounds_since_update >= 3:
+            pending = [t for t in self.todos if t.status != "completed"]
+            if pending:
+                return f"\n[提醒] 还有 {len(pending)} 个未完成的任务，记得更新 todo 状态。"return None
 ```
 
 关键设计：同时只能有一个 `in_progress` 任务。 这强迫模型专注于当前任务，而不是同时标记多个任务为进行中。
@@ -270,6 +617,22 @@ Claude Code 在 `getAllBaseTools()` 函数中返回一个 `Tools` 数组——�
 V1 是纯内存方案——所有 todo 存在 `appState.todos` 里：
 
 ```
+// TodoWriteTool.ts — V1 的核心逻辑async call({ todos }, context) {
+    const appState = context.getAppState()
+    const todoKey = context.agentId ?? getSessionId()
+    const oldTodos = appState.todos[todoKey] ?? []
+    const allDone = todos.every(_ => _.status === 'completed')
+    const newTodos = allDone ? [] : todos
+
+    context.setAppState(prev => ({
+        ...prev,
+        todos: {
+            ...prev.todos,
+            [todoKey]: newTodos,
+        },
+    }))
+    // ...
+}
 ```
 
 每次调用时，模型要传入整个 todo 列表的完整快照来覆盖旧列表。这意味着：
@@ -283,11 +646,45 @@ V1 是纯内存方案——所有 todo 存在 `appState.todos` 里：
 ### 3.todo 工具
 
 ```
+todo_manager = TodoManager()
+
+def run_todo(action: str, content: str = None,
+             todo_id: str = None, status: str = None) -> str:
+    if action == "add":
+        return f"Added: {todo_manager.add(content)}"elif action == "update":
+        return todo_manager.update(todo_id, status)
+    elif action == "view":
+        return todo_manager.view()
+    return f"Unknown action: {action}"
+
+TOOL_HANDLERS["todo"] = lambda **kw: run_todo(**kw)
 ```
 
 加进 TOOLS schema：
 
 ```
+{
+    "name": "todo",
+    "description": "管理任务列表。在开始多步任务时先创建 todo，每完成一步更新状态。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["add", "update", "view"],
+                "description": "add: 添加任务, update: 更新状态, view: 查看列表"
+            },
+            "content": {"type": "string", "description": "任务内容（add 时必填）"},
+            "todo_id": {"type": "string", "description": "任务 ID（update 时必填）"},
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "completed"],
+                "description": "新状态（update 时必填）"
+            }
+        },
+        "required": ["action"]
+    }
+}
 ```
 
 ### 4.attention_check：注意力机制
@@ -295,6 +692,17 @@ V1 是纯内存方案——所有 todo 存在 `appState.todos` 里：
 模型有时会忘记更新 todo。在每次 LLM 调用前检查：
 
 ```
+def agent_loop(query: str):
+    messages = [{"role": "user", "content": query}]
+
+    while True:
+        # 检查是否需要注入提醒
+        reminder = todo_manager.attention_check()
+        if reminder:
+            messages[-1]["content"] += reminder  # 附加到最新消息
+
+        response = client.messages.create(...)
+        # ... 正常循环 ...
 ```
 
 3 轮没有更新 todo 时，提醒会附加到当前消息末尾，让模型重新关注任务进度。
@@ -306,16 +714,39 @@ Claude Code 在内部用 `isTodoV2Enabled()` 做功能开关，将 TodoWrite（V
 #### 切换机制：isTodoV2Enabled
 
 ```
+// src/utils/tasks.ts
+export function isTodoV2Enabled(): boolean {
+// 通过环境变量强制启用（供 SDK 用户使用）
+  if (isEnvTruthy(process.env.CLAUDE_CODE_ENABLE_TASKS)) {
+    return true
+  }
+  // 交互式会话默认启用 V2；非交互式（SDK）默认用 V1
+  return !getIsNonInteractiveSession()
+}
 ```
 
 这个函数同时控制两侧：
 
 ```
+// TodoWriteTool.ts — V1 只在 V2 未启用时生效
+isEnabled() {
+    return !isTodoV2Enabled()
+}
+
+// TaskCreateTool.ts — V2 只在启用时生效
+isEnabled() {
+    return isTodoV2Enabled()
+}
 ```
 
 在 `src/tools.ts` 中，工具列表根据开关动态组装：
 
 ```
+// src/tools.ts
+TodoWriteTool,                          // V1，始终注册但 isEnabled 受控
+...(isTodoV2Enabled()
+  ? [TaskCreateTool, TaskGetTool, TaskUpdateTool, TaskListTool]
+  : []),
 ```
 
 #### Task 数据模型
@@ -323,6 +754,20 @@ Claude Code 在内部用 `isTodoV2Enabled()` 做功能开关，将 TodoWrite（V
 V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 
 ```
+// src/utils/tasks.ts — Task schema
+export const TaskSchema = lazySchema(() =>
+  z.object({
+    id: z.string(),
+    subject: z.string(),               // 任务标题（祈使句）
+    description: z.string(),            // 任务描述
+    activeForm: z.string().optional(),  // 进行中的展示文案（现在分词形式）
+    owner: z.string().optional(),       // 负责的 Agent ID
+    status: TaskStatusSchema(),         // pending | in_progress | completed
+    blocks: z.array(z.string()),        // 本任务阻塞了哪些任务
+    blockedBy: z.array(z.string()),     // 哪些任务阻塞了本任务
+    metadata: z.record(z.string(), z.unknown()).optional(),
+  }),
+)
 ```
 
 存储路径：`~/.claude/tasks/{taskListId}/{taskId}.json`。每个任务一个文件，支持文件锁（`proper-lockfile`）防止并发冲突。
@@ -332,11 +777,39 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 ##### TaskCreate：创建任务
 
 ```
+// src/tools/TaskCreateTool/TaskCreateTool.ts
+inputSchema: z.strictObject({
+    subject: z.string(),          // 任务标题
+    description: z.string(),      // 任务描述
+    activeForm: z.string().optional(),  // spinner 展示文案
+    metadata: z.record(z.string(), z.unknown()).optional(),
+})
 ```
 
 创建时自动触发 `executeTaskCreatedHooks`——如果 hook 返回 `blockingError`，任务会被立即删除：
 
 ```
+async call({ subject, description, activeForm, metadata }, context) {
+    const taskId = await createTask(getTaskListId(), {
+        subject, description, activeForm,
+        status: 'pending',
+        owner: undefined,
+        blocks: [], blockedBy: [],
+        metadata,
+    })
+
+    // 执行 TaskCreated hooksconst generator = executeTaskCreatedHooks(taskId, subject, description, ...)
+    for await (const result of generator) {
+        if (result.blockingError) {
+            blockingErrors.push(getTaskCreatedHookMessage(result.blockingError))
+        }
+    }
+    if (blockingErrors.length > 0) {
+        await deleteTask(getTaskListId(), taskId)
+        throw new Error(blockingErrors.join('\n'))
+    }
+    // ...
+}
 ```
 
 ##### TaskUpdate：更新任务
@@ -344,6 +817,17 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 可更新的字段最多：
 
 ```
+inputSchema: z.strictObject({
+    taskId: z.string(),
+    subject: z.string().optional(),
+    description: z.string().optional(),
+    activeForm: z.string().optional(),
+    status: TaskUpdateStatusSchema.optional(),  // 包含 'deleted' 特殊状态
+    addBlocks: z.array(z.string()).optional(),   // 添加阻塞关系
+    addBlockedBy: z.array(z.string()).optional(),
+    owner: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+})
 ```
 
 设置 `status: 'deleted'` 会物理删除任务文件。标记为 `completed` 时触发`executeTaskCompletedHooks`。
@@ -351,11 +835,23 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 一个重要细节：当 Agent Swarm 模式开启时，标记 `in_progress` 会自动设置 `owner`：
 
 ```
+// 自动设置 owner
+if (isAgentSwarmsEnabled() && status === 'in_progress'
+    && owner === undefined && !existingTask.owner) {
+    const agentName = getAgentName()
+    if (agentName) {
+        updates.owner = agentName
+    }
+}
 ```
 
 ##### TaskGet：查询单个任务
 
 ```
+inputSchema: z.strictObject({
+    taskId: z.string(),
+})
+// 返回: { id, subject, description, status, blocks, blockedBy }
 ```
 
 只读操作，标记了 `isReadOnly: true` 和 `isConcurrencySafe: true`。
@@ -363,6 +859,7 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 ##### TaskList：列出所有任务
 
 ```
+inputSchema: z.strictObject({})  // 无参数
 ```
 
 会过滤掉 `metadata._internal` 为 true 的内部任务，并且从 `blockedBy` 中去除已完成任务的引用——让模型看到的阻塞关系始终是有效的。
@@ -370,6 +867,10 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 ##### TaskStop：停止后台任务
 
 ```
+inputSchema: z.strictObject({
+    task_id: z.string().optional(),
+    shell_id: z.string().optional(),  // 向后兼容已废弃的 KillShell
+})
 ```
 
 这个工具停止的是后台运行的进程任务（如长时间运行的 shell 命令），不是 Task 列表中的逻辑任务。它保留了 `KillShell` 作为别名以兼容旧的 transcript。
@@ -377,11 +878,33 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 ##### V2 的文件存储与并发控制
 
 ```
+// src/utils/tasks.ts// 任务存储目录
+export function getTasksDir(taskListId: string): string {
+    return join(getClaudeConfigHomeDir(), 'tasks', sanitizePathComponent(taskListId))
+}
+
+// 创建任务 — 带文件锁
+export async function createTask(taskListId, taskData): Promise<string> {
+    const lockPath = await ensureTaskListLockFile(taskListId)
+    let release = await lockfile.lock(lockPath, LOCK_OPTIONS)
+    try {
+        const highestId = await findHighestTaskId(taskListId)
+        const id = String(highestId + 1)
+        const task = { id, ...taskData }
+        await writeFile(getTaskPath(taskListId, id), JSON.stringify(task, null, 2))
+        return id
+    } finally {
+        await release()
+    }
+}
 ```
 
 锁的参数为 swarm 场景优化——最多支持 10+ 个并发 Agent，重试 30 次，退避 5-100ms：
 
 ```
+const LOCK_OPTIONS = {
+    retries: { retries: 30, minTimeout: 5, maxTimeout: 100 }
+}
 ```
 
 删除任务时还会维护 high water mark 文件（`.highwatermark`），确保已删除的任务 ID 不会被复用。
@@ -391,6 +914,15 @@ V2 的任务不再是内存对象，而是磁盘上的 JSON 文件：
 V1 和 V2 都有一个相同的安全机制——当 3 个以上任务全部标记为 completed，且没有任何一个包含 “verif” 关键词时，工具返回中会注入一段提醒：
 
 ```
+// V2 中的实现（TaskUpdateTool.ts）
+if (updates.status === 'completed') {
+    const allTasks = await listTasks(taskListId)
+    const allDone = allTasks.every(t => t.status === 'completed')
+    if (allDone && allTasks.length >= 3
+        && !allTasks.some(t => /verif/i.test(t.subject))) {
+        verificationNudgeNeeded = true
+    }
+}
 ```
 
 注入的提醒会要求模型在写总结之前先 spawn 一个 verification agent。这是对“所有任务完成 -> 循环退出 -> 跳过验证”这个常见失败模式的结构性防御。
@@ -402,6 +934,24 @@ V1 和 V2 都有一个相同的安全机制——当 3 个以上任务全部标�
 对于“重构 src/ 目录下的所有模块”这样的任务：
 
 ```
+模型第 1 轮：
+  todo(add, "分析现有代码结构")
+  todo(add, "重构 auth.py")
+  todo(add, "重构 api.py")
+  todo(add, "运行测试")
+  todo(update, "1", "in_progress")
+
+模型第 2 轮：
+  bash("find src/ -name '*.py'")
+  read_file("src/auth.py")
+  todo(update, "1", "completed")
+  todo(update, "2", "in_progress")
+
+模型第 3 轮：
+  edit_file("src/auth.py", ...)
+  todo(update, "2", "completed")
+  todo(update, "3", "in_progress")
+  ...
 ```
 
 ![](/images/UP0ZwLC36iJAYAkNgc8cePzPn7c/img-5.png)
@@ -447,11 +997,37 @@ Agent 工作越久，messages 数组越胖。读文件、跑命令的每条输�
 `AgentTool.tsx` 定义了两层 schema。基础参数（`baseInputSchema`）：
 
 ```
+// src/tools/AgentTool/AgentTool.tsx
+const baseInputSchema = lazySchema(() => z.object({
+  description: z.string()
+    .describe('A short (3-5 word) description of the task'),
+  prompt: z.string()
+    .describe('The task for the agent to perform'),
+  subagent_type: z.string().optional()
+    .describe('The type of specialized agent to use for this task'),
+  model: z.enum(['sonnet', 'opus', 'haiku']).optional()
+    .describe("Optional model override for this agent."),
+  run_in_background: z.boolean().optional()
+    .describe('Set to true to run this agent in the background.')
+}));
 ```
 
 完整参数（`fullInputSchema`）在基础上扩展了多 Agent 协作与隔离：
 
 ```
+// 多 Agent 参数
+name:      z.string().optional()   // 让 Agent 可通过 SendMessage({to: name}) 被寻址
+team_name: z.string().optional()   // 团队名称
+mode:      permissionModeSchema()  // 权限模式，如 "plan" 需要审批
+
+// 隔离模式
+isolation: z.enum(['worktree', 'remote']).optional()
+  // "worktree" — 创建临时 git worktree，Agent 在代码副本上工作
+  // "remote"  — 在远程 CCR 环境中启动（始终后台运行）
+
+// 工作目录覆盖
+cwd: z.string().optional()
+  // 绝对路径，覆盖 Agent 的工作目录，与 worktree 互斥
 ```
 
 这意味着 Claude Code 的 Agent 不是简单的“子任务执行器”，而是支持 模型选择 / 后台执行 / 团队协作 / 代码隔离 的完整多 Agent 系统。
@@ -467,11 +1043,26 @@ Agent 工作越久，messages 数组越胖。读文件、跑命令的每条输�
 #### QueryChainTracking：嵌套 Agent 是支持的
 
 ```
+// src/Tool.ts
+export type QueryChainTracking = {
+  chainId: string   // UUID，同一条调用链共享
+  depth: number     // 0 = 顶层 Agent，每嵌套一层 +1
+}
 ```
 
 在 `query.ts` 中，每次进入 query 循环时：
 
 ```
+// src/query.ts — 初始化或递增
+const queryTracking = toolUseContext.queryTracking
+  ? {
+      chainId: toolUseContext.queryTracking.chainId,
+      depth: toolUseContext.queryTracking.depth + 1,  // 嵌套时 +1
+    }
+  : {
+      chainId: deps.uuid(),   // 顶层生成新 UUID
+      depth: 0,               // 顶层从 0 开始
+    }
 ```
 
 这意味着 Claude Code 支持 Agent 嵌套调用：Agent A 调用 Agent B，Agent B 再调用 Agent C，depth 从 0 → 1 → 2 递增。`chainId` 保持不变，用于遥测和调试时追踪整条调用链。
@@ -479,6 +1070,15 @@ Agent 工作越久，messages 数组越胖。读文件、跑命令的每条输�
 #### 120 秒自动转后台
 
 ```
+// src/tools/AgentTool/AgentTool.tsx
+function getAutoBackgroundMs(): number {
+  if (isEnvTruthy(process.env.CLAUDE_AUTO_BACKGROUND_TASKS)
+    || getFeatureValue_CACHED_MAY_BE_STALE(
+         'tengu_auto_background_agents', false)) {
+    return 120_000;  // 120 秒
+  }
+  return 0;
+}
 ```
 
 如果一个同步 Agent 执行超过 120 秒，会自动转为后台任务。这解决了“子任务意外耗时很长，阻塞父 Agent 交互”的问题。
@@ -488,6 +1088,14 @@ Agent 工作越久，messages 数组越胖。读文件、跑命令的每条输�
 后台 Agent 有完整的进度跟踪机制：
 
 ```
+// src/tasks/LocalAgentTask/LocalAgentTask.tsx
+export type AgentProgress = {
+  toolUseCount: number;      // 已执行的工具调用次数
+  tokenCount: number;        // 消耗的 token 总数
+  lastActivity?: ToolActivity;
+  recentActivities?: ToolActivity[];  // 最近 5 条活动
+  summary?: string;          // 周期性摘要
+};
 ```
 
 `LocalAgentTask` 负责本地后台 Agent，`RemoteAgentTask` 负责远程 CCR 环境中的 Agent。两者都通过 `registerAsyncAgent` / `registerRemoteAgentTask` 注册到 AppState，父 Agent 可以随时查看进度。
@@ -499,11 +1107,104 @@ Agent 工作越久，messages 数组越胖。读文件、跑命令的每条输�
 #### Subagent 运行器
 
 ```
+import uuid
+
+# 模拟 QueryChainTracking
+def make_tracking(parent_tracking=None):
+    """生成调用链追踪信息"""if parent_tracking:
+        return {
+            "chain_id": parent_tracking["chain_id"],
+            "depth": parent_tracking["depth"] + 1
+        }
+    return {"chain_id": str(uuid.uuid4()), "depth": 0}
+
+def run_subagent(prompt: str, parent_tracking=None,
+                 model=None) -> str:
+    """启动子 Agent，返回最终摘要文本
+
+    与 Claude Code 的关键对应：
+    - parent_tracking → QueryChainTracking（支持嵌套）
+    - model → AgentTool 的 model 参数
+    - CHILD_TOOLS 包含 task → 允许递归（靠 depth 追踪）
+    """
+    tracking = make_tracking(parent_tracking)
+    use_model = model or MODEL
+
+    sub_messages = [{"role": "user", "content": prompt}]
+
+    for _ in range(30):  # 安全限制
+        response = client.messages.create(
+            model=use_model,
+            system=SUBAGENT_SYSTEM,
+            messages=sub_messages,
+            tools=PARENT_TOOLS,  # 子 Agent 也有 task 工具，允许嵌套
+            max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            break
+
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                if block.name == "task":
+                    # 递归调用子 Agent，传递 tracking
+                    output = run_subagent(
+                        block.input["prompt"],
+                        parent_tracking=tracking,
+                        model=block.input.get("model"),
+                    )
+                else:
+                    handler = TOOL_HANDLERS.get(block.name)
+                    output = (handler(**block.input) if handler
+                              else f"Unknown tool: {block.name}")
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output)[:50000]
+                })
+        sub_messages.append({"role": "user", "content": results})
+
+    return "".join(
+        b.text for b in response.content if hasattr(b, "text")
+    ) or "(no summary)"
 ```
 
 ### 5.task 工具定义
 
 ```
+PARENT_TOOLS = BASE_TOOLS + [
+    {
+        "name": "task",
+        "description": (
+            "启动子 Agent 处理子任务，返回摘要。""子 Agent 有独立的上下文和完整的工具能力（包括再次调用 task）。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "3-5 个词的任务简述"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "子任务的完整描述，需自包含"
+                },
+                "model": {
+                    "type": "string",
+                    "enum": ["sonnet", "opus", "haiku"],
+                    "description": "可选的模型覆盖"
+                }
+            },
+            "required": ["description", "prompt"]
+        }
+    }
+]
+
+TOOL_HANDLERS["task"] = lambda **kw: run_subagent(
+    kw["prompt"], model=kw.get("model")
+)
 ```
 
 注意：子 Agent 拥有 `task` 工具。 与我们最初以为的“禁止递归”不同，Claude Code 通过 `QueryChainTracking.depth` 追踪嵌套深度而非禁止嵌套。实际的安全边界是 `maxTurns` 限制和 token 预算，而不是剥夺工具。
@@ -513,6 +1214,11 @@ Agent 工作越久，messages 数组越胖。读文件、跑命令的每条输�
 父 Agent 给子 Agent 的 prompt 必须包含所有必要的上下文，因为子 Agent 看不到父 Agent 的对话历史。
 
 ```
+# 错误：子 Agent 不知道"这个项目"是什么"找出这个项目使用的测试框架"
+# 正确：自包含的任务描述
+"读取 /workspace/learn-claude-code 项目根目录下的文件，
+ 找出使用的测试框架（查看 requirements.txt、setup.py、pyproject.toml 等），
+ 返回测试框架名称和版本。"
 ```
 
 ### 7.什么时候用 task
@@ -582,11 +1288,22 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 只支持目录格式：`skill-name/SKILL.md`。
 
 ```
+~/.claude/skills/
+  code-review/SKILL.md        ← 完整的代码审查指南
+  write-tests/SKILL.md        ← 测试编写最佳实践
 ```
 
 源码中 `loadSkillsFromSkillsDir()` 函数明确只接受目录，单独的 `.md` 文件会被跳过：
 
 ```
+// 来自 loadSkillsDir.ts → loadSkillsFromSkillsDir()
+if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+  // Single .md files are NOT supported in /skills/ directory
+  return null
+}
+
+const skillDirPath = join(basePath, entry.name)
+const skillFilePath = join(skillDirPath, 'SKILL.md')
 ```
 
 #### 路径 2：遗留 `/commands/` 目录（已废弃）
@@ -594,6 +1311,15 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 同时支持目录格式（`SKILL.md`）和单文件格式（`xxx.md`）。源码将 `loadedFrom` 标记为 `'commands_DEPRECATED'`：
 
 ```
+// 来自 loadSkillsDir.ts → loadSkillsFromCommandsDir()
+skills.push({
+  skill: createSkillCommand({
+    ...parsed,
+    loadedFrom: 'commands_DEPRECATED',  // 明确标记废弃
+    paths: undefined,  // 遗留路径不支持条件激活
+  }),
+  filePath,
+})
 ```
 
 #### 路径 3：MCP 技能
@@ -601,6 +1327,11 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 通过 `mcpSkillBuilders.ts` 注册表模式实现。这是一个依赖解耦技巧——`loadSkillsDir.ts` 在模块初始化时注册构建函数，MCP 模块在需要时取用，避免循环依赖：
 
 ```
+// loadSkillsDir.ts 尾部
+registerMCPSkillBuilders({
+  createSkillCommand,
+  parseSkillFrontmatterFields,
+})
 ```
 
 #### 路径 4：内置技能（Bundled Skills）
@@ -608,6 +1339,16 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 编译进 CLI 的技能，通过 `bundledSkills.ts` 中的 `registerBundledSkill()` 注册。内置技能可以携带附加文件（`files` 字段），首次调用时才解压到磁盘：
 
 ```
+// 来自 bundledSkills.ts
+if (files && Object.keys(files).length > 0) {
+  skillRoot = getBundledSkillExtractDir(definition.name)
+  let extractionPromise: Promise<string | null> | undefinedconst inner = definition.getPromptForCommand
+  getPromptForCommand = async (args, ctx) => {
+    extractionPromise ??= extractBundledSkillFiles(definition.name, files)
+    const extractedDir = await extractionPromise
+    // ...
+  }
+}
 ```
 
 注意 `extractionPromise ??= ...` 这个写法——通过缓存 Promise（而非结果）保证并发调用者共享同一次解压操作。
@@ -617,6 +1358,20 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 `getSkillDirCommands()` 函数定义了严格的加载优先级。所有层级并行加载，然后按顺序合并——靠前的优先：
 
 ```
+// 来自 loadSkillsDir.ts → getSkillDirCommands()
+const [
+  managedSkills,      // 1. 策略级（企业管控）
+  userSkills,         // 2. 用户级（~/.claude/skills/）
+  projectSkillsNested,// 3. 项目级（.claude/skills/，含父目录遍历）
+  additionalSkillsNested, // 4. --add-dir 指定的额外目录
+  legacyCommands,     // 5. 遗留 /commands/（废弃）
+] = await Promise.all([
+  loadSkillsFromSkillsDir(managedSkillsDir, 'policySettings'),
+  loadSkillsFromSkillsDir(userSkillsDir, 'userSettings'),
+  Promise.all(projectSkillsDirs.map(dir =>loadSkillsFromSkillsDir(dir, 'projectSettings'))),
+  Promise.all(additionalDirs.map(dir =>loadSkillsFromSkillsDir(join(dir, '.claude', 'skills'), 'projectSettings'))),
+  loadSkillsFromCommandsDir(cwd),
+])
 ```
 
 对应的目录路径：
@@ -624,6 +1379,14 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 加载后通过 `realpath` 进行跨路径去重（处理符号链接和重叠的父目录扫描）：
 
 ```
+// 来自 loadSkillsDir.ts
+async function getFileIdentity(filePath: string): Promise<string | null> {
+  try {
+    return await realpath(filePath)
+  } catch {
+    return null
+  }
+}
 ```
 
 ### 5.源码实证：Frontmatter 元数据
@@ -633,11 +1396,43 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 `parseSkillFrontmatterFields()` 函数展示了完整字段集：
 
 ```
+---
+name: "Code Review"                 # 显示名称
+description: "专业代码审查"          # 技能描述
+allowed-tools:                       # 自动授权的工具列表
+    - Read
+    - Grep
+    - Glob
+when-to-use: "当用户要求审查代码时"   # 模型判断何时使用
+model: opus                          # 模型覆盖（inherit = 继承当前）
+user-invocable: true                 # 用户是否可直接 /xxx 调用
+disable-model-invocation: false      # 禁止模型主动调用
+context: fork                        # 执行模式：inline 或 fork
+effort: high                         # 推理投入度
+paths:                               # 条件激活的路径模式
+    - "src/**/*.ts"
+    - "!**/test/**"
+hooks:                               # 生命周期钩子
+    PreToolUse:
+        - matcher: ".*"
+        hooks:
+            - command: "echo hook fired"
+shell:                               # Shell 执行设置
+    type: bash
+---
 ```
 
 源码中的返回值类型直接反映这些字段：
 
 ```
+// parseSkillFrontmatterFields() 返回值（简化）
+{
+  displayName, description, allowedTools, argumentHint,
+  argumentNames, whenToUse, version, model,
+  disableModelInvocation, userInvocable, hooks,
+  executionContext,  // 'fork' | undefined
+  agent, effort, shell,
+}
 ```
 
 ### 6.源码实证：条件技能与动态发现
@@ -647,11 +1442,27 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 带 `paths` 字段的技能不会立即加入上下文。它们被存入 `conditionalSkills` Map，当用户操作的文件路径匹配时才激活：
 
 ```
+// 来自 loadSkillsDir.ts → activateConditionalSkillsForPaths()
+const skillIgnore = ignore().add(skill.paths)  // gitignore 风格匹配
+for (const filePath of filePaths) {
+  const relativePath = isAbsolute(filePath)
+    ? relative(cwd, filePath)
+    : filePath
+  if (skillIgnore.ignores(relativePath)) {
+    dynamicSkills.set(name, skill)
+    conditionalSkills.delete(name)
+    activatedConditionalSkillNames.add(name)
+    break
+  }
+}
 ```
 
 模式匹配使用 `ignore` 库（与 `.gitignore` 相同的语法），支持否定模式。这意味着你可以写：
 
 ```
+paths:
+  - "src/**/*.ts"
+  - "!**/generated/**"
 ```
 
 #### 动态目录发现
@@ -659,6 +1470,18 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 `discoverSkillDirsForPaths()` 在文件操作时自动发现嵌套的 `.claude/skills/` 目录：
 
 ```
+// 来自 loadSkillsDir.ts → discoverSkillDirsForPaths()
+while (currentDir.startsWith(resolvedCwd + pathSep)) {
+  const skillDir = join(currentDir, '.claude', 'skills')
+  if (!dynamicSkillDirs.has(skillDir)) {
+    dynamicSkillDirs.add(skillDir)
+    // 检查 gitignore 以阻止 node_modules 内的技能if (await isPathGitignored(currentDir, resolvedCwd)) {
+      continue
+    }
+    newDirs.push(skillDir)
+  }
+  currentDir = dirname(currentDir)
+}
 ```
 
 安全措施：被 `.gitignore` 排除的目录（如 `node_modules/some-pkg/.claude/skills/`）不会被加载。
@@ -668,11 +1491,25 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 技能提示中支持两个特殊变量和内联 Shell 命令：
 
 ```
+// 来自 loadSkillsDir.ts → createSkillCommand() → getPromptForCommand()
+
+// 变量替换
+finalContent = finalContent.replace(/\$\{CLAUDE_SKILL_DIR\}/g, skillDir)
+finalContent = finalContent.replace(/\$\{CLAUDE_SESSION_ID\}/g, getSessionId())
+
+// Shell 命令执行（仅非 MCP 技能）if (loadedFrom !== 'mcp') {
+  finalContent = await executeShellCommandsInPrompt(finalContent, ...)
+}
 ```
 
 这意味着在 SKILL.md 中可以写：
 
 ```
+当前技能目录：${CLAUDE_SKILL_DIR}
+会话 ID：${CLAUDE_SESSION_ID}
+
+运行 lint 检查：
+!`cd ${CLAUDE_SKILL_DIR} && npm run lint 2>&1 | head -20`
 ```
 
 关键安全边界：MCP 技能（远程且不可信）永远不会执行内联 Shell 命令.
@@ -686,6 +1523,19 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 技能内容注入为 user message，模型在同一上下文中继续处理：
 
 ```
+// SkillTool.ts → call()
+// Inline 路径：processPromptSlashCommand 展开技能内容
+const processedCommand = await processPromptSlashCommand(
+  commandName, args || '', commands, context,
+)
+
+return {
+  data: { success: true, commandName, allowedTools, model },
+  newMessages,           // 技能内容作为新消息注入
+  contextModifier(ctx) { // 修改后续上下文（工具权限、模型等）
+  // ... 合并 allowedTools、覆盖模型、设置 effort
+  },
+}
 ```
 
 #### Fork 模式（子 Agent）
@@ -693,6 +1543,21 @@ Claude Code 的技能系统并不只有一种目录格式。源码 `loadSkillsDi
 当 frontmatter 指定 `context: fork` 时，技能在隔离的子 Agent 中执行，拥有独立 token 预算：
 
 ```
+// SkillTool.ts → call()
+if (command?.type === 'prompt' && command.context === 'fork') {
+  return executeForkedSkill(command, commandName, args, context, ...)
+}
+
+// executeForkedSkill() 内部
+for await (const message of runAgent({
+  agentDefinition,
+  promptMessages,
+  // ...
+})) {
+  agentMessages.push(message)
+}
+const resultText = extractResultText(agentMessages, 'Skill execution completed')
+agentMessages.length = 0  // 释放内存
 ```
 
 Fork 模式的优势：
@@ -708,11 +1573,29 @@ Fork 模式的优势：
 `prompt.ts` 中的技能列表注入有精确的预算控制机制——系统提示只放名称和描述，占上下文窗口的 1%：
 
 ```
+// 来自 prompt.ts
+export const SKILL_BUDGET_CONTEXT_PERCENT = 0.01
+export const CHARS_PER_TOKEN = 4
+export const DEFAULT_CHAR_BUDGET = 8_000  // Fallback: 1% of 200k x 4
+
+// 每条描述硬上限 250 字符
+export const MAX_LISTING_DESC_CHARS = 250
 ```
 
 当技能过多时自动截断描述。内置技能（bundled）永远保留完整描述，其余技能按剩余预算均匀分配：
 
 ```
+// formatCommandsWithinBudget()（简化）
+const bundledChars = ... // 内置技能始终完整
+const remainingBudget = budget - bundledChars
+const maxDescLen = Math.floor(availableForDescs / restCommands.length)
+
+if (maxDescLen < MIN_DESC_LENGTH) {
+  // 极端情况：非内置技能只显示名称return commands.map(cmd => bundledIndices.has(i)
+    ? fullEntries[i].full
+    : `- ${cmd.name}`
+  ).join('\n')
+}
 ```
 
 ### 10.从零实现--python简易版  skill loading
@@ -722,6 +1605,135 @@ Fork 模式的优势：
 捕捉核心机制：
 
 ```
+import os
+import re
+import yaml
+from pathlib import Path
+
+class SkillLoader:
+    def __init__(self, skills_dirs: list[Path] = None):
+        """多目录技能加载器，模拟真实的优先级解析"""
+        self.skills_dirs = skills_dirs or [Path("skills")]
+        self.skills: dict[str, dict] = {}
+        self.conditional_skills: dict[str, dict] = {}
+        self._scan()
+
+    def _parse_frontmatter(self, content: str) -> tuple[dict, str]:
+        """解析 YAML frontmatter"""if content.startswith('---'):
+            end = content.find('---', 3)
+            if end != -1:
+                fm_text = content[3:end].strip()
+                body = content[end + 3:].strip()
+                try:
+                    fm = yaml.safe_load(fm_text) or {}
+                    return fm, body
+                except yaml.YAMLError:
+                    passreturn {}, content
+
+    def _scan(self):
+        """扫描所有技能目录，按优先级加载（先加载的优先）"""
+        seen = set()
+        for skills_dir in self.skills_dirs:
+            if not skills_dir.exists():
+                continuefor skill_dir in sorted(skills_dir.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                skill_md = skill_dir / "SKILL.md"if not skill_md.exists():
+                    continue# 去重：已存在则跳过（模拟 realpath 去重）
+                resolved = skill_md.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+
+                content = skill_md.read_text()
+                frontmatter, body = self._parse_frontmatter(content)
+
+                name = frontmatter.get("name", skill_dir.name)
+                desc = frontmatter.get("description", "")
+                if not desc:
+                    # fallback：取 markdown 第一行
+                    lines = body.strip().splitlines()
+                    desc = lines[0].lstrip("# ").strip() if lines else ""
+
+                skill_info = {
+                    "name": name,
+                    "description": desc,
+                    "when_to_use": frontmatter.get("when-to-use", ""),
+                    "allowed_tools": frontmatter.get("allowed-tools", []),
+                    "paths": frontmatter.get("paths"),
+                    "context": frontmatter.get("context"),  # fork / inline"model": frontmatter.get("model"),
+                    "path": skill_md,
+                    "base_dir": str(skill_dir),
+                    "body": body,
+                }
+
+                slug = skill_dir.name
+
+                # 条件技能：有 paths 字段的延迟激活if skill_info["paths"]:
+                    self.conditional_skills[slug] = skill_info
+                else:
+                    self.skills[slug] = skill_info
+
+    def activate_for_paths(self, file_paths: list[str], cwd: str) -> list[str]:
+        """当文件被操作时，激活匹配的条件技能（简化版 gitignore 匹配）"""import fnmatch
+        activated = []
+        to_remove = []
+        for slug, skill in self.conditional_skills.items():
+            patterns = skill["paths"]
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            for fp in file_paths:
+                rel = os.path.relpath(fp, cwd)
+                if any(fnmatch.fnmatch(rel, p) for p in patterns):
+                    self.skills[slug] = skill
+                    to_remove.append(slug)
+                    activated.append(slug)
+                    breakfor slug in to_remove:
+            del self.conditional_skills[slug]
+        return activated
+
+    def list_summary(self, char_budget: int = 8000) -> str:
+        """生成技能列表摘要，带预算控制"""if not self.skills:
+            return "No skills available."
+
+        lines = ["## Available Skills\n"]
+        total_chars = 0for slug, info in self.skills.items():
+            desc = info["description"]
+            if info["when_to_use"]:
+                desc = f"{desc} - {info['when_to_use']}"# 单条描述硬上限（模拟 MAX_LISTING_DESC_CHARS = 250）if len(desc) > 250:
+                desc = desc[:249] + "..."
+            entry = f"- **{slug}**: {desc}"if total_chars + len(entry) > char_budget:
+                entry = f"- **{slug}**"  # 超预算只显示名称
+            lines.append(entry)
+            total_chars += len(entry)
+
+        lines.append("\n使用 Skill 工具加载完整技能文档。")
+        return "\n".join(lines)
+
+    def load(self, skill_name: str) -> dict:
+        """加载完整技能，返回内容和元数据"""if skill_name not in self.skills:
+            available = ", ".join(self.skills.keys())
+            raise ValueError(f"Skill '{skill_name}' not found. Available: {available}")
+
+        skill = self.skills[skill_name]
+        content = skill["body"]
+
+        # 变量替换（模拟 ${CLAUDE_SKILL_DIR}）
+        content = content.replace("${SKILL_DIR}", skill["base_dir"])
+
+        return {
+            "content": f"Base directory for this skill: {skill['base_dir']}\n\n{content}",
+            "allowed_tools": skill["allowed_tools"],
+            "model": skill["model"],
+            "context": skill["context"],
+        }
+
+# 实例化：模拟真实的多目录优先级
+skill_loader = SkillLoader([
+    Path.home() / ".claude" / "managed" / "skills",  # 1. 策略级
+    Path.home() / ".claude" / "skills",               # 2. 用户级
+    Path(".claude") / "skills",                        # 3. 项目级
+])
 ```
 
 ### 11.集成到 Agent
@@ -729,11 +1741,55 @@ Fork 模式的优势：
 System prompt 注入技能列表：
 
 ```
+SYSTEM = f"""你是一个 Coding Agent，可以执行工具完成编程任务。
+
+{skill_loader.list_summary()}
+"""
 ```
 
 Skill 工具（区分 inline 和 fork 模式）：
 
 ```
+TOOLS.append({
+    "name": "Skill",
+    "description": "Execute a skill within the main conversation. ""When users reference a slash command (e.g. /commit), use this tool.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "skill": {
+                "type": "string",
+                "description": "技能名称（目录名），如 'code-review', 'write-tests'"
+            },
+            "args": {
+                "type": "string",
+                "description": "可选参数"
+            }
+        },
+        "required": ["skill"]
+    }
+})
+
+def handle_skill(skill: str, args: str = "") -> dict:
+    """处理技能调用，区分 inline 和 fork 模式"""
+    result = skill_loader.load(skill)
+
+    if result["context"] == "fork":
+        # Fork 模式：启动子 Agent
+        sub_result = run_sub_agent(
+            prompt=result["content"],
+            allowed_tools=result["allowed_tools"],
+            model=result.get("model"),
+        )
+        return {"status": "forked", "result": sub_result}
+
+    # Inline 模式：注入到当前会话return {
+        "status": "inline",
+        "content": result["content"],
+        "allowed_tools": result["allowed_tools"],
+        "model": result.get("model"),
+    }
+
+TOOL_HANDLERS["Skill"] = lambda **kw: handle_skill(kw["skill"], kw.get("args", ""))
 ```
 
 ---
@@ -745,6 +1801,41 @@ Skill 工具（区分 inline 和 fork 模式）：
 ### 13.SKILL.md 示例
 
 ```
+---name: Code Review
+description: 专业代码审查技能，覆盖安全性、性能、可维护性
+when-to-use: 当用户要求审查代码、做 PR review 或检查代码质量时
+allowed-tools:
+    - Read
+    - Grep
+    - Glob
+    paths:
+        - "src/**"
+        - "!**/test/**"
+---
+## 审查维度
+
+### 安全性
+- [ ] SQL 注入：所有数据库操作使用参数化查询
+- [ ] 输入验证：外部输入在边界处验证
+- [ ] 敏感信息：密钥、密码不硬编码
+
+### 性能
+- [ ] N+1 查询：循环内不调用数据库
+- [ ] 无用导入：删除未使用的 import
+
+### 可读性
+- [ ] 函数长度：超过 50 行考虑拆分
+- [ ] 命名：变量名表达意图，不用单字母
+
+## 输出格式
+
+每个问题按以下格式报告：
+**[严重度]** 文件:行号 -- 问题描述
+建议：具体修改方案
+
+## 辅助脚本
+运行项目 lint：
+!`cd ${CLAUDE_SKILL_DIR} && cat lint-rules.json`
 ```
 
 ### 14.架构要点总结
@@ -796,6 +1887,16 @@ Microcompact 是最轻量的一层，不调用 LLM，直接在消息数组上做
 每次 LLM 调用前执行，把旧的 tool\_result 替换为占位符。只处理特定工具类型：
 
 ```
+// 源码：microCompact.ts:41-50
+const COMPACTABLE_TOOLS = new Set<string>([
+  FILE_READ_TOOL_NAME,
+  ...SHELL_TOOL_NAMES,    // Bash, BashBackground 等GREP_TOOL_NAME,
+  GLOB_TOOL_NAME,
+  WEB_SEARCH_TOOL_NAME,
+  WEB_FETCH_TOOL_NAME,
+  FILE_EDIT_TOOL_NAME,
+  FILE_WRITE_TOOL_NAME,
+])
 ```
 
 保留最近 N 个结果（由 `keepRecent` 控制，默认 5），早期结果被替换为 `[Old tool result content cleared]`。
@@ -805,6 +1906,12 @@ Microcompact 是最轻量的一层，不调用 LLM，直接在消息数组上做
 当用户离开超过 30-60 分钟再回来时，服务端的 prompt cache 几乎必然已过期。此时触发更激进的清理：
 
 ```
+// 源码：timeBasedMCConfig.ts:30-34
+const TIME_BASED_MC_CONFIG_DEFAULTS: TimeBasedMCConfig = {
+  enabled: false,
+  gapThresholdMinutes: 60,   // 服务端 1h cache TTL 过期
+  keepRecent: 5,
+}
 ```
 
 #### 路径 C：缓存编辑（Cached Microcompact）
@@ -816,6 +1923,33 @@ Microcompact 是最轻量的一层，不调用 LLM，直接在消息数组上做
 核心思路很简单——把旧的工具输出替换为一行占位符：
 
 ```
+KEEP_RECENT = 3   # 保留最近 3 个 tool_result
+def micro_compact(messages: list) -> list:
+    """把旧的 tool_result 替换为简短占位符"""# 收集所有 tool_result
+    tool_results = []
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for j, part in enumerate(msg["content"]):
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_results.append((i, j, part))
+
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+
+    # 把早期的大结果替换为占位符
+    for i, j, part in tool_results[:-KEEP_RECENT]:
+        if len(str(part.get("content", ""))) > 100:
+            # 从对应的 tool_use block 里找工具名
+            tool_name = _find_tool_name(messages, part.get("tool_use_id", ""))
+            part["content"] = f"[Previous: used {tool_name}]"return messages
+
+def _find_tool_name(messages: list, tool_use_id: str) -> str:
+    for msg in messages:
+        if msg["role"] == "assistant":
+            for block in (msg.get("content") or []):
+                if hasattr(block, "id") and block.id == tool_use_id:
+                    return block.name
+    return "tool"
 ```
 
 效果：大量工具输出被压缩为一行，模型仍然知道“做过这件事”，但不再占用大量上下文。
@@ -831,6 +1965,17 @@ Step 1：预处理
 发送给摘要模型之前，先做两步清理：
 
 ```
+// 源码：compact.ts:145-199 — 剥离图片和文档
+export function stripImagesFromMessages(messages: Message[]): Message[] {
+// image -> [image], document -> [document]
+// 包括嵌套在 tool_result 里的媒体块
+}
+
+// 源码：compact.ts:211-223 — 剥离会被重新注入的 attachment
+export function stripReinjectedAttachments(messages: Message[]): Message[] {
+// 移除 skill_discovery / skill_listing 类型的 attachment
+// 因为压缩后会重新注入
+}
 ```
 
 Step 2：Fork Sonnet 生成摘要
@@ -842,6 +1987,16 @@ Prompt 要求模型输出两个 XML 块：
 - `<summary>` — 最终摘要，包含 9 个结构化部分
 
 ```
+// 源码：prompt.ts — summary 的 9 个部分
+1. Primary Request and Intent — 用户的明确请求
+2. Key Technical Concepts — 技术概念和框架
+3. Files and Code Sections — 涉及的文件和代码片段
+4. Errors and fixes — 遇到的错误和修复方式
+5. Problem Solving — 已解决的问题
+6. All user messages — 所有非 tool_result 的用户消息
+7. Pending Tasks — 待完成的任务
+8. Current Work — 压缩前正在做的事
+9. Optional Next Step — 下一步计划（含原文引用防止漂移）
 ```
 
 Step 3：PTL 重试循环
@@ -849,6 +2004,16 @@ Step 3：PTL 重试循环
 如果 compact 本身的请求也超出了 prompt-too-long 限制，会进入重试循环：
 
 ```
+// 源码：compact.ts:227-291const MAX_PTL_RETRIES = 3
+export function truncateHeadForPTLRetry(
+  messages: Message[],
+  ptlResponse: AssistantMessage,
+): Message[] | null {
+  // 按 API-round 分组（groupMessagesByApiRound）
+  // 从头部丢弃最老的组，直到腾出足够空间
+  // 如果有 tokenGap 信息，精确丢弃；否则丢弃 20% 的组
+  // 至少保留一个组用于生成摘要
+}
 ```
 
 Step 4：后置附件注入
@@ -856,6 +2021,12 @@ Step 4：后置附件注入
 压缩完成后，自动附加关键上下文，确保模型不会“失忆”：
 
 ```
+// 源码：compact.ts:122-131
+export const POST_COMPACT_MAX_FILES_TO_RESTORE = 5   // 最多恢复 5 个最近读取的文件
+export const POST_COMPACT_TOKEN_BUDGET = 50_000       // 总预算 50K token
+export const POST_COMPACT_MAX_TOKENS_PER_FILE = 5_000
+export const POST_COMPACT_MAX_TOKENS_PER_SKILL = 5_000
+export const POST_COMPACT_SKILLS_TOKEN_BUDGET = 25_000
 ```
 
 附件包括：最近读取的文件内容、当前 plan、已激活的 skill、工具/agent 列表变化量。
@@ -871,6 +2042,42 @@ Full Compact 还支持两种部分压缩方向：
 #### 从零实现
 
 ```
+import json, time
+from pathlib import Path
+
+TRANSCRIPT_DIR = Path(".transcripts")
+TRANSCRIPT_DIR.mkdir(exist_ok=True)
+
+def full_compact(messages: list) -> list:
+    """Fork Sonnet 生成结构化摘要"""# 1. 保存完整记录
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[compact] Saved transcript to {path}")
+
+    # 2. LLM 生成摘要
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{
+            "role": "user",
+            "content": (
+                "以下是一段 Agent 的对话记录。"
+                "请生成一份结构化摘要，包含：\n"
+                "1. 用户请求  2. 技术概念  3. 文件和代码\n"
+                "4. 错误和修复  5. 待完成任务  6. 当前工作\n\n"
+                "先在 <analysis> 中梳理思路，再在 <summary> 中给出最终摘要。\n\n"
+                + json.dumps(messages, default=str)[:80000]
+            )
+        }],
+        max_tokens=2000,
+    )
+    summary = response.content[0].text
+
+    # 3. 用摘要替换整个 messagesreturn [
+        {"role": "user", "content": f"[对话摘要]\n\n{summary}"},
+        {"role": "assistant", "content": "明白，我会在此基础上继续。"},
+    ]
 ```
 
 ### 4.Layer 3：Auto Compact — 阈值触发 + 熔断器
@@ -880,6 +2087,10 @@ Auto Compact 是调度层——决定何时触发压缩，以及选择哪种压�
 #### 触发阈值
 
 ```
+// 源码：autoCompact.ts:63-66export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+export const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
+export const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
+export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 ```
 
 阈值计算：`context_window - max_output_tokens - AUTOCOMPACT_BUFFER_TOKENS`
@@ -891,6 +2102,7 @@ Auto Compact 是调度层——决定何时触发压缩，以及选择哪种压�
 连续失败 3 次后停止重试，避免浪费 API 调用：
 
 ```
+// 源码：autoCompact.ts:70const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3// BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures// wasting ~250K API calls/day globally
 ```
 
 #### 压缩策略选择
@@ -898,6 +2110,21 @@ Auto Compact 是调度层——决定何时触发压缩，以及选择哪种压�
 Auto Compact 触发后，先尝试轻量级的 Session Memory 压缩，失败才回退到 Full Compact：
 
 ```
+// 源码：autoCompact.ts:288-310// EXPERIMENT: Try session memory compaction firstconst sessionMemoryResult = await trySessionMemoryCompaction(
+  messages,
+  toolUseContext.agentId,
+  recompactionInfo.autoCompactThreshold,
+)
+if (sessionMemoryResult) {
+  setLastSummarizedMessageId(undefined)
+  runPostCompactCleanup(querySource)
+  return { wasCompacted: true, compactionResult: sessionMemoryResult }
+}
+
+// 失败则走 Full Compactconst compactionResult = await compactConversation(
+  messages, toolUseContext, cacheSafeParams,
+  true,      // suppressFollowUpQuestionsundefined, // no custom instructionstrue,      // isAutoCompact
+)
 ```
 
 #### 禁用条件
@@ -917,6 +2144,22 @@ Auto Compact 在以下情况会被跳过：
 #### 从零实现
 
 ```
+THRESHOLD = 50_000    # token 阈值
+MAX_FAILURES = 3      # 熔断器
+
+_consecutive_failures = 0def auto_compact_if_needed(messages: list) -> list:
+    """阈值触发自动压缩，带熔断器"""global _consecutive_failures
+
+    if _consecutive_failures >= MAX_FAILURES:
+        return messages
+
+    if estimate_tokens(messages) < THRESHOLD:
+        return messages
+
+    try:
+        result = full_compact(messages)
+        _consecutive_failures = 0return result
+    except Exception:
 ```
 
 ### 5.Layer 3：Auto Compact — 阈值触发 + 熔断器
@@ -926,6 +2169,11 @@ Auto Compact 是调度层——决定何时触发压缩，以及选择哪种压�
 #### 触发阈值
 
 ```
+// 源码：autoCompact.ts:63-66
+export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+export const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
+export const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
+export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 ```
 
 阈值计算：`context_window - max_output_tokens - AUTOCOMPACT_BUFFER_TOKENS`
@@ -937,6 +2185,10 @@ Auto Compact 是调度层——决定何时触发压缩，以及选择哪种压�
 连续失败 3 次后停止重试，避免浪费 API 调用：
 
 ```
+// 源码：autoCompact.ts:70
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+// BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures
+// wasting ~250K API calls/day globally
 ```
 
 #### 压缩策略选择
@@ -944,6 +2196,26 @@ Auto Compact 是调度层——决定何时触发压缩，以及选择哪种压�
 Auto Compact 触发后，先尝试轻量级的 Session Memory 压缩，失败才回退到 Full Compact：
 
 ```
+// 源码：autoCompact.ts:288-310
+// EXPERIMENT: Try session memory compaction first
+const sessionMemoryResult = await trySessionMemoryCompaction(
+  messages,
+  toolUseContext.agentId,
+  recompactionInfo.autoCompactThreshold,
+)
+if (sessionMemoryResult) {
+  setLastSummarizedMessageId(undefined)
+  runPostCompactCleanup(querySource)
+  return { wasCompacted: true, compactionResult: sessionMemoryResult }
+}
+
+// 失败则走 Full Compact
+const compactionResult = await compactConversation(
+  messages, toolUseContext, cacheSafeParams,
+  true,      // suppressFollowUpQuestions
+  undefined, // no custom instructions
+  true,      zz// isAutoCompact
+)
 ```
 
 #### 禁用条件
@@ -963,6 +2235,27 @@ Auto Compact 在以下情况会被跳过：
 #### 从零实现
 
 ```
+THRESHOLD = 50_000    # token 阈值
+MAX_FAILURES = 3      # 熔断器
+
+_consecutive_failures = 0
+def auto_compact_if_needed(messages: list) -> list:
+    """阈值触发自动压缩，带熔断器"""
+    global _consecutive_failures
+
+    if _consecutive_failures >= MAX_FAILURES:
+        return messages
+
+    if estimate_tokens(messages) < THRESHOLD:
+        return messages
+
+    try:
+        result = full_compact(messages)
+        _consecutive_failures = 0
+        return result
+    except Exception:
+        _consecutive_failures += 1
+        return messages
 ```
 
 ### 6.辅助机制：Session Memory
@@ -974,6 +2267,12 @@ Session Memory 是一个更轻量级的会话记忆系统，独立于三层压�
 Session Memory 基于两个阈值的双重门控：
 
 ```
+// 源码：sessionMemoryUtils.ts:31-36
+export const DEFAULT_SESSION_MEMORY_CONFIG: SessionMemoryConfig = {
+  minimumMessageTokensToInit: 10000,   // 首次触发：上下文达 10K token
+  minimumTokensBetweenUpdate: 5000,    // 后续更新：增长 5K token
+  toolCallsBetweenUpdates: 3,          // 且至少 3 次工具调用
+}
 ```
 
 必须同时满足 token 增长阈值 AND 工具调用阈值（或当前轮没有工具调用时只需 token 阈值）。
@@ -981,6 +2280,15 @@ Session Memory 基于两个阈值的双重门控：
 #### 笔记模板
 
 ```
+# Session Title
+# Current State     ← 压缩后恢复的关键
+# Task specification
+# Files and Functions
+# Workflow# Errors & Corrections
+# Codebase and System Documentation
+# Learnings
+# Key results
+# Worklog
 ```
 
 每个 section 上限约 2000 token，全文上限 12000 token。超限时模型被提示“MUST condense”。
@@ -994,6 +2302,43 @@ Session Memory 不替代 Full Compact，而是提供了一种更省钱的替代�
 #### 从零实现
 
 ```
+# 手动压缩工具
+TOOL_HANDLERS["compact"] = lambda **kw: _manual_compact()
+_compact_requested = Falsedef _manual_compact():
+    global _compact_requested
+    _compact_requested = Truereturn "Compacting conversation..."
+    def agent_loop(messages: list):
+    while True:
+        # Layer 1：静默微压缩（每轮）
+        micro_compact(messages)
+
+        # Layer 3：超出阈值自动压缩（内部调用 Layer 2）
+        messages[:] = auto_compact_if_needed(messages)
+
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM,
+            messages=messages, tools=TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            break
+
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = TOOL_HANDLERS.get(block.name, lambda **kw: "Unknown tool")(**block.input)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output)[:50000]
+                })
+        messages.append({"role": "user", "content": results})
+
+        # 手动压缩标志global _compact_requested
+        if _compact_requested:
+            messages[:] = full_compact(messages)
+            _compact_requested = False
 ```
 
 ### 8.源码中的关键设计决策
@@ -1073,11 +2418,30 @@ TaskCreate/Update/Get/List 是面向用户的 V2 Tool 接口——模型通过�
 Claude Code 不是只有一种“任务”。它有 7 种 TaskType，每种有唯一的 ID 前缀：
 
 ```
+// src/Task.tsexport type TaskType =
+  | 'local_bash'          // 前缀 'b' — 本地 shell 命令
+  | 'local_agent'         // 前缀 'a' — 本地 agent 子会话
+  | 'remote_agent'        // 前缀 'r' — 远程 agent
+  | 'in_process_teammate' // 前缀 't' — 进程内协作者
+  | 'local_workflow'      // 前缀 'w' — 本地工作流脚本
+  | 'monitor_mcp'         // 前缀 'm' — MCP 监控
+  | 'dream'               // 前缀 'd' — 后台推测任务
 ```
 
 ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合）：
 
 ```
+// src/Task.ts
+export function generateTaskId(type: TaskType): string {
+  const prefix = getTaskIdPrefix(type)
+  const bytes = randomBytes(8)
+  let id = prefix
+  for (let i = 0; i < 8; i++) {
+    id += TASK_ID_ALPHABET[bytes[i]! % TASK_ID_ALPHABET.length]
+  }
+  return id
+}
+// 示例：local_bash → "b3k7f9x2a"，local_agent → "ahj4m8n1p"
 ```
 
 #### 统一的状态生命周期
@@ -1085,6 +2449,12 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 所有任务共享一个 5 态生命周期：
 
 ```
+// src/Task.tsexport type TaskStatus =
+  | 'pending'    // 已创建，等待启动
+  | 'running'    // 执行中
+  | 'completed'  // 成功完成
+  | 'failed'     // 失败
+  | 'killed'     // 被用户或系统终止
 ```
 
 ![](/images/UP0ZwLC36iJAYAkNgc8cePzPn7c/img-11.png)
@@ -1092,16 +2462,55 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 终态守卫——防止对已死任务做状态转换：
 
 ```
+// src/Task.ts
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return status === 'completed' || status === 'failed' || status === 'killed'
+}
 ```
 
 #### TaskStateBase：所有任务的公共骨架
 
 ```
+// src/Task.ts
+export type TaskStateBase = {
+  id: string           // 带前缀的唯一 ID
+  type: TaskType       // 任务类型
+  status: TaskStatus   // 当前状态
+  description: string  // 人类可读描述
+  toolUseId?: string   // 关联的 tool_use IDs
+  tartTime: number    // 创建时间戳
+  endTime?: number     // 结束时间戳
+  outputFile: string   // 磁盘输出文件路径
+  outputOffset: number // 已读取的字节偏移量
+  notified: boolean    // 父级是否已被通知
+}
+
+export function createTaskStateBase(
+  id: string, type: TaskType,
+  description: string, toolUseId?: string,
+): TaskStateBase {
+  return {
+    id, type, status: 'pending', description, toolUseId,
+    startTime: Date.now(),
+    outputFile: getTaskOutputPath(id),
+    outputOffset: 0,
+    notified: false,
+  }
+}
 ```
 
 每种具体任务在此基础上扩展自己的字段。类型联合体确保类型安全：
 
 ```
+// src/tasks/types.ts
+export type TaskState =
+  | LocalShellTaskState
+  | LocalAgentTaskState
+  | RemoteAgentTaskState
+  | InProcessTeammateTaskState
+  | LocalWorkflowTaskState
+  | MonitorMcpTaskState
+  | DreamTaskState
 ```
 
 #### framework.ts：任务引擎的四大核心函数
@@ -1111,6 +2520,27 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 ##### registerTask() — 注册任务到全局状态
 
 ```
+// src/utils/task/framework.ts
+export function registerTask(task: TaskState, setAppState: SetAppState): void {
+  let isReplacement = falsesetAppState(prev => {
+    const existing = prev.tasks[task.id]
+    isReplacement = existing !== undefined
+    // 恢复时保留 UI 状态（retain, startTime, messages）
+    const merged = existing && 'retain' in existing
+      ? { ...task, retain: existing.retain, startTime: existing.startTime,
+          messages: existing.messages, diskLoaded: existing.diskLoaded,
+          pendingMessages: existing.pendingMessages }
+      : task
+    return { ...prev, tasks: { ...prev.tasks, [task.id]: merged } }
+  })
+
+  // 替换（恢复）不是新启动，跳过避免重复发送
+  if (isReplacement) returnenqueueSdkEvent({
+    type: 'system', subtype: 'task_started',
+    task_id: task.id, description: task.description,
+    task_type: task.type, ...
+  })
+}
 ```
 
 关键设计：
@@ -1124,6 +2554,19 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 ##### updateTaskState() — 类型安全的状态更新
 
 ```
+export function updateTaskState<T extends TaskState>(
+  taskId: string,
+  setAppState: SetAppState,
+  updater: (task: T) => T,
+): void {
+  setAppState(prev => {
+    const task = prev.tasks?.[taskId] as T | undefinedif (!task) return prev
+    const updated = updater(task)
+    // 同引用 → 无变化 → 跳过 spread，避免不必要的 re-render
+    if (updated === task) return prev
+    return { ...prev, tasks: { ...prev.tasks, [taskId]: updated } }
+  })
+}
 ```
 
 泛型 `<T extends TaskState>` 让每种任务实现在更新时拿到自己的具体类型，而不是宽泛的联合体。
@@ -1131,6 +2574,22 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 ##### evictTerminalTask() — 完成后驱逐释放内存
 
 ```
+export function evictTerminalTask(
+  taskId: string, setAppState: SetAppState,
+): void {
+  setAppState(prev => {
+    const task = prev.tasks?.[taskId]
+    if (!task) return prev
+    if (!isTerminalTaskStatus(task.status)) return prev  // 非终态，不驱逐
+    if (!task.notified) return prev  // 还没通知父级，不驱逐
+    // 面板宽限期：local_agent 有 retain 字段，需要等 evictAfter
+    if ('retain' in task && (task.evictAfter ?? Infinity) > Date.now()) {
+      return prev
+    }
+    const { [taskId]: _, ...remainingTasks } = prev.tasks
+    return { ...prev, tasks: remainingTasks }
+  })
+}
 ```
 
 驱逐有三道守卫：终态 → 已通知 → 宽限期过期。
@@ -1138,11 +2597,33 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 ##### generateTaskAttachments() — 轮询输出增量
 
 ```
+export async function generateTaskAttachments(state: AppState): Promise<{
+  attachments: TaskAttachment[]
+  updatedTaskOffsets: Record<string, number>
+  evictedTaskIds: string[]
+}> {
+  for (const taskState of Object.values(tasks)) {
+    if (taskState.notified && isTerminalTaskStatus(taskState.status)) {
+      evictedTaskIds.push(taskState.id)  // 已消费的终态任务 → GCcontinue
+    }
+    if (taskState.status === 'running') {
+      const delta = await getTaskOutputDelta(
+        taskState.id, taskState.outputOffset)
+      if (delta.content) {
+        updatedTaskOffsets[taskState.id] = delta.newOffset
+      }
+    }
+  }
+  return { attachments, updatedTaskOffsets, evictedTaskIds }
+}
 ```
 
 关键常量：
 
 ```
+export const POLL_INTERVAL_MS = 1000     // 轮询间隔
+export const STOPPED_DISPLAY_MS = 3_000  // killed 后显示时长
+export const PANEL_GRACE_MS = 30_000     // 面板宽限期（30 秒）
 ```
 
 #### 任务注册表：tasks.ts
@@ -1150,6 +2631,22 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 所有任务类型在 `src/tasks.ts` 注册，形成统一分发：
 
 ```
+// src/tasks.ts
+export function getAllTasks(): Task[] {
+  const tasks: Task[] = [
+    LocalShellTask,
+    LocalAgentTask,
+    RemoteAgentTask,
+    DreamTask,
+  ]
+  if (LocalWorkflowTask) tasks.push(LocalWorkflowTask)
+  if (MonitorMcpTask) tasks.push(MonitorMcpTask)
+  return tasks
+}
+
+export function getTaskByType(type: TaskType): Task | undefined {
+  return getAllTasks().find(t => t.type === type)
+}
 ```
 
 每个 `Task` 实现必须提供 `name`、`type`、`kill()` 方法。spawn 和 render 是各类型自行实现的，不走多态分发。
@@ -1163,6 +2660,9 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 任务不把输出存在内存里——它们写到磁盘文件，框架按偏移量增量读取：
 
 ```
+~/.claude/task-output/
+  b3k7f9x2a.output    ← local_bash 任务的完整 stdout/stderr
+  ahj4m8n1p.output    ← local_agent 任务的输出
 ```
 
 - `initTaskOutput(taskId)`：安全创建输出文件（`O_NOFOLLOW | O_EXCL` 防符号链接攻击）
@@ -1192,9 +2692,22 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 每个任务是 `.tasks/` 目录下的一个 JSON 文件：
 
 ```
+.tasks/
+  task_001.json
+  task_002.json
+  task_003.json
 ```
 
 ```
+{
+"id": "task_002",
+"title": "重构 auth.py",
+"description": "提取 JWT 验证逻辑到独立函数",
+"status": "ready","blockedBy": ["task_001"],
+"blocks": ["task_004"],
+"created_at": "2025-01-01T10:00:00",
+"completed_at": null
+}
 ```
 
 `blockedBy`：这个任务需要等哪些任务先完成。 `blocks`：这个任务完成后，会解锁哪些任务。
@@ -1202,11 +2715,117 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 #### TaskManager 实现
 
 ```
+import json, uuid
+from pathlib import Path
+from datetime import datetime
+from typing import Literal
+
+TASKS_DIR = Path(".tasks")
+TASKS_DIR.mkdir(exist_ok=True)
+
+Status = Literal["pending", "ready", "in_progress", "completed", "failed"]
+
+class TaskManager:
+    def create(self, title: str, description: str = "",
+               blocked_by: list[str] = None) -> str:
+        task_id = f"task_{uuid.uuid4().hex[:6]}"
+        status = "pending" if blocked_by else "ready"
+        task = {
+            "id": task_id,
+            "title": title,
+            "description": description,
+            "status": status,
+            "blockedBy": blocked_by or [],
+            "blocks": [],
+            "created_at": datetime.now().isoformat(),
+            "completed_at": None,
+        }
+        # 把这个任务注册到前置任务的 blocks 列表
+        for dep_id in (blocked_by or []):
+            self._add_block(dep_id, task_id)
+        self._save(task)
+        return task_id
+
+    def complete(self, task_id: str) -> str:
+        task = self._load(task_id)
+        if not task:
+            return f"Task {task_id} not found"
+        task["status"] = "completed"
+        task["completed_at"] = datetime.now().isoformat()
+        self._save(task)
+        # 检查并解锁下游任务
+        unlocked = self._unlock_downstream(task_id)
+        msg = f"Completed: {task_id}"
+        if unlocked:
+            msg += f"\nUnlocked: {', '.join(unlocked)}"return msg
+
+    def _unlock_downstream(self, completed_id: str) -> list[str]:
+        """检查所有被 completed_id 阻塞的任务，看是否可以解锁"""
+        unlocked = []
+        for path in TASKS_DIR.glob("*.json"):
+            task = json.loads(path.read_text())
+            if completed_id in task.get("blockedBy", []):
+                # 检查所有前置任务是否都已完成
+                all_done = all(
+                    self._get_status(dep) == "completed"for dep in task["blockedBy"]
+                )
+                if all_done:
+                    task["status"] = "ready"
+                    self._save(task)
+                    unlocked.append(task["id"])
+        return unlocked
+
+    def list_ready(self) -> list[dict]:
+        return [t for t in self._all() if t["status"] == "ready"]
+
+    def list_all(self) -> str:
+        tasks = self._all()
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for t in tasks:
+            icon = {"ready": "○", "in_progress": "◐", "completed": "●",
+                    "pending": "⏸", "failed": "✗"}.get(t["status"], "?")
+            dep = f" [blocked by: {', '.join(t['blockedBy'])}]" if t["blockedBy"] and t["status"] == "pending" else ""
+            lines.append(f"{icon} {t['id']}: {t['title']}{dep}")
+        return "\n".join(lines)
+
+    def _save(self, task: dict):
+        (TASKS_DIR / f"{task['id']}.json").write_text(json.dumps(task, indent=2))
+
+    def _load(self, task_id: str) -> dict | None:
+        path = TASKS_DIR / f"{task_id}.json"return json.loads(path.read_text()) if path.exists() else Nonedef _get_status(self, task_id: str) -> str:
+        task = self._load(task_id)
+        return task["status"] if task else "not_found"def _all(self) -> list[dict]:
+        return [json.loads(p.read_text()) for p in sorted(TASKS_DIR.glob("*.json"))]
+
+    def _add_block(self, task_id: str, blocked_task_id: str):
+        task = self._load(task_id)
+        if task and blocked_task_id not in task["blocks"]:
+            task["blocks"].append(blocked_task_id)
+            self._save(task)
 ```
 
 #### 工具接口
 
 ```
+task_manager = TaskManager()
+
+def run_task_tool(action: str, **kwargs) -> str:
+    if action == "create":
+        return task_manager.create(
+            title=kwargs["title"],
+            description=kwargs.get("description", ""),
+            blocked_by=kwargs.get("blocked_by", [])
+        )
+    elif action == "complete":
+        return task_manager.complete(kwargs["task_id"])
+    elif action == "list":
+        return task_manager.list_all()
+    elif action == "list_ready":
+        ready = task_manager.list_ready()
+        return "\n".join(f"- {t['id']}: {t['title']}" for t in ready) or "No ready tasks."
+    return f"Unknown action: {action}"
 ```
 
 #### DAG 执行流程
@@ -1246,6 +2865,8 @@ ID 生成算法：前缀 + 8 位随机字符（36 进制，约 2.8 万亿组合�
 ### 1.问题
 
 ```
+# 同步执行：卡住整个循环，等待 3 分钟output = run_bash("npm install && npm run build")
+# 3 分钟后才能继续...
 ```
 
 Agent 被迫等待，什么都干不了。
@@ -1265,6 +2886,18 @@ Claude Code 不只能后台跑 shell 命令。它的 `src/tasks/` 目录下有 6
 源码 `guards.ts` 定义了任务状态：
 
 ```
+// src/tasks/LocalShellTask/guards.ts
+export type LocalShellTaskState = TaskStateBase & {
+  type: 'local_bash'command: string
+  result?: {
+    code: number         // 进程退出码
+    interrupted: boolean // 是否被中断
+  }
+  shellCommand: ShellCommand | null
+  isBackgrounded: boolean   // false=前台运行, true=已放入后台
+  agentId?: AgentId         // 哪个 agent 启动的，用于孤儿清理
+  kind?: 'bash' | 'monitor' // UI 显示变体
+}
 ```
 
 关键点：`isBackgrounded` 区分前台和后台。一个命令可以先在前台运行，跑久了再切到后台。
@@ -1272,6 +2905,51 @@ Claude Code 不只能后台跑 shell 命令。它的 `src/tasks/` 目录下有 6
 #### 启动流程
 
 ```
+// src/tasks/LocalShellTask/LocalShellTask.tsx (简化)
+export async function spawnShellTask(input, context): Promise<TaskHandle> {
+  const { command, description, shellCommand, toolUseId, agentId } = input
+  const taskId = shellCommand.taskOutput.taskId
+  
+  // 1. 注册清理回调（进程退出时自动 kill）
+  const unregisterCleanup = registerCleanup(async () => {
+    killTask(taskId, setAppState)
+  })
+
+  // 2. 创建任务状态，注册到全局 tasks 表
+  const taskState: LocalShellTaskState = {
+    ...createTaskStateBase(taskId, 'local_bash', description, toolUseId),
+    type: 'local_bash',
+    status: 'running',
+    command,
+    shellCommand,
+    isBackgrounded: true,
+    agentId,
+  }
+  registerTask(taskState, setAppState)
+
+  // 3. 切换到后台模式——TaskOutput 自动持续接收数据
+  shellCommand.background(taskId)
+
+  // 4. 启动 Stall Watchdog（检测交互式卡住）
+  const cancelStallWatchdog = startStallWatchdog(taskId, description, ...)
+
+  // 5. 等待结果，完成时更新状态并发送通知
+  void shellCommand.result.then(async result => {
+    cancelStallWatchdog()
+    await flushAndCleanup(shellCommand)
+    updateTaskState(taskId, setAppState, task => ({
+      ...task,
+      status: result.code === 0 ? 'completed' : 'failed',
+      result: { code: result.code, interrupted: result.interrupted },
+      shellCommand: null,
+      endTime: Date.now(),
+    }))
+    enqueueShellNotification(taskId, description, status, result.code, ...)
+    void evictTaskOutput(taskId)
+  })
+
+  return { taskId, cleanup: () => unregisterCleanup() }
+}
 ```
 
 #### Stall Watchdog：检测交互式阻塞
@@ -1279,6 +2957,17 @@ Claude Code 不只能后台跑 shell 命令。它的 `src/tasks/` 目录下有 6
 Claude Code 有个精妙的机制——当后台命令停止输出 45 秒，且输出尾部看起来像交互式提示符时，主动通知模型：
 
 ```
+// 每 5 秒检查一次
+const STALL_CHECK_INTERVAL_MS = 5_000const STALL_THRESHOLD_MS = 45_000
+// 匹配的模式：(y/n)、Continue?、Press Enter 等
+
+const PROMPT_PATTERNS = [
+  /\(y\/n\)/i,
+  /\(yes\/no\)/i,
+  /Continue\?/i,
+  /Press (any key|Enter)/i,
+  /Overwrite\?/i,
+]
 ```
 
 watchdog 通过 `fs.stat()` 监控输出文件大小变化。文件大小不增长 + 尾部匹配 prompt 模式 = 发出通知，告诉模型 “这个命令可能卡在交互提示上，kill 掉重试吧”。
@@ -1288,6 +2977,13 @@ watchdog 通过 `fs.stat()` 监控输出文件大小变化。文件大小不增�
 完成通知以 XML 格式注入到消息流：
 
 ```
+<task-notification>
+<task-id>bash_abc123</task-id>
+<tool-use-id>toolu_xyz</tool-use-id>
+<output-file>/tmp/.../tasks/bash_abc123.output</output-file>
+<status>completed</status>
+<summary>Background command "npm install" completed (exit code 0)</summary>
+</task-notification>
 ```
 
 通知通过 `enqueuePendingNotification()` 放入队列，在下一轮 LLM 调用前注入到对话中。
@@ -1297,6 +2993,28 @@ watchdog 通过 `fs.stat()` 监控输出文件大小变化。文件大小不增�
 `killShellTasks.ts` 处理两种场景：
 
 ```
+// 1. 手动 kill 单个任务
+export function killTask(taskId, setAppState): void {
+  updateTaskState(taskId, setAppState, task => {
+    task.shellCommand?.kill()
+    task.shellCommand?.cleanup()
+    task.unregisterCleanup?.()
+    return { ...task, status: 'killed', notified: true, shellCommand: null }
+  })
+  void evictTaskOutput(taskId)
+}
+
+// 2. Agent 退出时清理所有它启动的 shell 任务（防止僵尸进程）
+export function killShellTasksForAgent(agentId, getAppState, setAppState): void {
+  const tasks = getAppState().tasks ?? {}
+  for (const [taskId, task] of Object.entries(tasks)) {
+    if (isLocalShellTask(task) && task.agentId === agentId && task.status === 'running') {
+      killTask(taskId, setAppState)
+    }
+  }
+  // 清除该 agent 的待处理通知
+  dequeueAllMatching(cmd => cmd.agentId === agentId)
+}
 ```
 
 `killShellTasksForAgent` 是关键——没有它，子 Agent 退出后启动的 `npm run dev` 会变成僵尸进程，跑到天荒地老。
@@ -1310,6 +3028,16 @@ Claude Code 支持一个命令从前台无缝切换到后台。流程分三步�
 `backgroundAll()` 在用户按 Ctrl+B 时，同时处理所有前台的 bash 任务和 agent 任务：
 
 ```
+export function backgroundAll(getAppState, setAppState): void {
+  // 后台化所有前台 bash 任务
+  for (const taskId of foregroundBashTaskIds) {
+    backgroundTask(taskId, getAppState, setAppState)
+  }
+  // 后台化所有前台 agent 任务
+  for (const taskId of foregroundAgentTaskIds) {
+    backgroundAgentTask(taskId, getAppState, setAppState)
+  }
+}
 ```
 
 ---
@@ -1319,6 +3047,16 @@ Claude Code 支持一个命令从前台无缝切换到后台。流程分三步�
 `DreamTask` 是一种特殊的后台任务——不执行用户命令，而是自动整理对话记忆。它的状态结构很独特：
 
 ```
+// src/tasks/DreamTask/DreamTask.ts
+export type DreamTaskState = TaskStateBase & {
+  type: 'dream'
+  phase: 'starting' | 'updating'  // starting→reading sessions, updating→writing CLAUDE.md
+  sessionsReviewing: number       // 正在复习多少个 session
+  filesTouched: string[]          // 修改了哪些文件（不完全，仅工具调用可见的）
+  turns: DreamTurn[]              // 最多保留 30 轮助手文本
+  abortController?: AbortController
+  priorMtime: number              // 用于 kill 时回滚 consolidation lock
+}
 ```
 
 DreamTask 的特殊之处：
@@ -1330,6 +3068,22 @@ DreamTask 的特殊之处：
 3. kill 时回滚 lock——用户中止 dream 后，回滚 consolidation lock 的 mtime，让下次 session 可以重试
 
 ```
+export const DreamTask: Task = {
+  name: 'DreamTask',
+  type: 'dream',
+  async kill(taskId, setAppState) {
+    let priorMtime: number | undefined
+    updateTaskState<DreamTaskState>(taskId, setAppState, task => {
+      if (task.status !== 'running') return task
+      task.abortController?.abort()
+      priorMtime = task.priorMtimereturn { ...task, status: 'killed', notified: true }
+    })
+    // 回滚 lock，让下次 session 可以重新 dream
+    if (priorMtime !== undefined) {
+      await rollbackConsolidationLock(priorMtime)
+    }
+  },
+}
 ```
 
 ---
@@ -1339,6 +3093,33 @@ DreamTask 的特殊之处：
 当用户按两次 Ctrl+B，当前对话本身会被放入后台。这是最“重量级”的后台任务——整个 query 循环在后台继续：
 
 ```
+// src/tasks/LocalMainSessionTask.ts
+export function registerMainSessionTask(
+  description: string,
+  setAppState: SetAppState,
+  mainThreadAgentDefinition?: AgentDefinition,
+  existingAbortController?: AbortController,
+): { taskId: string; abortSignal: AbortSignal } {
+  // ID 用 's' 前缀，区分于 agent 任务的 'a' 前缀
+  const taskId = generateMainSessionTaskId()  // 例如 "s7k2m9x1"
+  
+  // 输出指向独立的 transcript 文件（不能写主 session 文件，否则 /clear 后会损坏）
+  void initTaskOutputAsSymlink(
+    taskId,
+    getAgentTranscriptPath(asAgentId(taskId)),
+  )
+
+  const taskState: LocalMainSessionTaskState = {
+    ...createTaskStateBase(taskId, 'local_agent', description),
+    type: 'local_agent',
+    agentType: 'main-session',  // 标识这是主会话，不是子 agent
+    status: 'running',
+    isBackgrounded: true,
+  }
+  registerTask(taskState, setAppState)
+
+  return { taskId, abortSignal: abortController.signal }
+}
 ```
 
 `startBackgroundSession()` 则是完整的后台 query 运行器：它克隆当前消息列表，在后台 `for await` 一个新的 `query()` 调用，实时更新 progress（toolUseCount、tokenCount、recentActivities），并逐条写入独立的 sidechain transcript。
@@ -1358,6 +3139,7 @@ DreamTask 的特殊之处：
 #### PANEL_GRACE_MS 面板驱逐
 
 ```
+// src/utils/task/framework.tsexport const PANEL_GRACE_MS = 30_000  // 30 秒
 ```
 
 任务完成后，在状态栏 pill 和 Shift+Down 面板中保留 30 秒，然后驱逐。这给用户足够时间看到完成状态，又不会让面板堆满历史任务。
@@ -1367,6 +3149,12 @@ DreamTask 的特殊之处：
 `LocalAgentTask` 追踪子 Agent 的进度，用于 UI 展示：
 
 ```
+export type AgentProgress = {
+  toolUseCount: number         // 工具调用次数
+  tokenCount: number           // token 消耗量
+  lastActivity?: ToolActivity  // 最近一次工具调用
+  recentActivities?: ToolActivity[]  // 最近 5 次活动
+}
 ```
 
 token 计数有个细节：API 的 `input_tokens` 是每轮累计的（包含所有历史 context），所以只取最新值；`output_tokens` 是每轮独立的，需要累加。
@@ -1382,11 +3170,108 @@ token 计数有个细节：API 的 `input_tokens` 是每轮累计的（包含所
 ### 9.从零实现：BackgroundManager
 
 ```
+import threading, subprocess, queue, time, uuid
+from dataclasses import dataclass
+
+@dataclassclass BackgroundJob:
+    job_id: str
+    command: str
+    status: str = "running"   # running | completed | failed
+    output: str = ""
+    started_at: float = 0.0
+    completed_at: float = 0.0class BackgroundManager:
+    def __init__(self):
+        self.jobs: dict[str, BackgroundJob] = {}
+        self.notifications: queue.Queue = queue.Queue()
+
+    def run(self, command: str) -> str:
+        """启动后台命令，立即返回 job_id"""
+        job_id = f"job_{uuid.uuid4().hex[:6]}"
+        job = BackgroundJob(
+            job_id=job_id,
+            command=command,
+            started_at=time.time()
+        )
+        self.jobs[job_id] = job
+
+        # 守护线程执行子进程
+        thread = threading.Thread(
+            target=self._execute,
+            args=(job,),
+            daemon=True  # 主进程退出时自动清理
+        )
+        thread.start()
+        return f"Started background job: {job_id}\nCommand: {command}"
+        
+    def _execute(self, job: BackgroundJob):
+        try:
+            result = subprocess.run(
+                job.command, shell=True,
+                capture_output=True, text=True, timeout=600
+            )
+            job.output = (result.stdout + result.stderr)[:50000]
+            job.status = "completed" if result.returncode == 0 else "failed"
+        except subprocess.TimeoutExpired:
+            job.output = "Timeout after 600 seconds"
+            job.status = "failed"
+        except Exception as e:
+            job.output = str(e)
+            job.status = "failed"
+
+        job.completed_at = time.time()
+        # 完成时放入通知队列
+        self.notifications.put({
+            "job_id": job.job_id,
+            "status": job.status,
+            "output": job.output,
+            "duration": f"{job.completed_at - job.started_at:.1f}s"
+        })
+
+    def check(self, job_id: str) -> str:
+        """查询特定任务状态"""
+        job = self.jobs.get(job_id)
+        if not job:
+            return f"Job {job_id} not found"
+        elapsed = time.time() - job.started_at
+        if job.status == "running":
+            return f"Job {job_id}: still running ({elapsed:.1f}s elapsed)"
+        return f"Job {job_id}: {job.status}\nOutput:\n{job.output}"
+        
+    def drain_notifications(self) -> list[dict]:
+        """取出所有待处理的完成通知（每次 LLM 调用前调用）"""
+        notifications = []
+        while not self.notifications.empty():
+            try:
+                notifications.append(self.notifications.get_nowait())
+            except queue.Empty:
+                breakreturn notifications
 ```
 
 ### 10.从零实现：集成到 Agent 循环
 
 ```
+bg_manager = BackgroundManager()
+
+TOOL_HANDLERS["background_run"] = lambda **kw: bg_manager.run(kw["command"])
+TOOL_HANDLERS["check"] = lambda **kw: bg_manager.check(kw["job_id"])
+
+def agent_loop(messages: list):
+    while True:
+        # 每次 LLM 调用前：把后台任务完成通知注入消息
+        notifications = bg_manager.drain_notifications()
+        if notifications:
+            notice_text = "\n".join(
+                f"[Background job completed]\n"
+                f"job_id: {n['job_id']}\n"
+                f"status: {n['status']}\n"
+                f"duration: {n['duration']}\n"
+                f"output: {n['output'][:1000]}"
+                for n in notifications
+            )
+            messages.append({"role": "user", "content": notice_text})
+
+        response = client.messages.create(...)
+        # ... 正常循环 ...
 ```
 
 通知以普通 user 消息注入，模型可以看到后台任务的结果并继续推理。
@@ -1394,4 +3279,26 @@ token 计数有个细节：API 的 `input_tokens` 是每轮累计的（包含所
 ### 11.从零实现：工具 Schema
 
 ```
+{
+    "name": "background_run",
+    "description": "在后台运行慢命令，立即返回 job_id。适合 npm install、pytest、docker build 等耗时操作。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "要在后台执行的 shell 命令"}
+        },
+        "required": ["command"]
+    }
+},
+{
+    "name": "check",
+    "description": "查询后台任务状态",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "background_run 返回的 job_id"}
+        },
+        "required": ["job_id"]
+    }
+}
 ```

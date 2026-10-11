@@ -28,6 +28,8 @@ const isHome = current === '/';
       try {
         var t = localStorage.getItem('theme');
         if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+        // 侧栏收起状态恢复（避免闪烁）
+        if (localStorage.getItem('sidebar-hidden') === '1') document.documentElement.classList.add('sb-hidden');
       } catch (e) {}
     </script>
   </head>
@@ -43,6 +45,7 @@ const isHome = current === '/';
               <div class="brand-tagline">{SITE.tagline}</div>
             </div>
             <button class="theme-toggle" data-theme-toggle title="切换白天/夜晚模式">🌗</button>
+            <button class="theme-toggle" data-sidebar-collapse title="收起目录栏">«</button>
           </div>
 
           <button class="sidebar-search" data-search-open>🔍 搜索内容…</button>
@@ -102,6 +105,7 @@ const isHome = current === '/';
             <a href="/about/" class={current.startsWith('/about') ? 'active' : ''}>关于</a>
           </nav>
           <div style="display:flex;gap:.4rem;align-items:center">
+            <button class="theme-toggle" data-sidebar-show title="展开目录栏" style="display:none">☰</button>
             <button class="theme-toggle" data-theme-toggle title="切换白天/夜晚模式">🌗</button>
             <button class="search-btn" data-search-open>🔍 搜索</button>
           </div>
@@ -149,6 +153,30 @@ const isHome = current === '/';
           });
         });
         applyIcon();
+      })();
+
+      // ===== 侧边栏整体收起/展开 =====
+      (function () {
+        function apply() {
+          var hidden = document.documentElement.classList.contains('sb-hidden');
+          var showBtn = document.querySelector('[data-sidebar-show]') as HTMLElement | null;
+          if (showBtn) showBtn.style.display = hidden ? '' : 'none';
+        }
+        document.querySelectorAll('[data-sidebar-collapse]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            document.documentElement.classList.add('sb-hidden');
+            try { localStorage.setItem('sidebar-hidden', '1'); } catch (e) {}
+            apply();
+          });
+        });
+        document.querySelectorAll('[data-sidebar-show]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            document.documentElement.classList.remove('sb-hidden');
+            try { localStorage.setItem('sidebar-hidden', '0'); } catch (e) {}
+            apply();
+          });
+        });
+        apply();
       })();
 
       // ===== 侧边栏栏目折叠/展开（状态记忆） =====

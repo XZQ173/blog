@@ -66,6 +66,10 @@ tags: [飞书同步]
 pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张图：
 
 ```
+路线 A（现在能跑）              路线 B（设计目标，当前是桩）
+src/agent.ts（有状态 Agent）     src/harness/agent-harness.ts（契约+桩）
+  └─ agent-loop.ts（循环）          └─ docs/harness-v2.md 规定的完整语义
+       └─ StreamFn（LLM 调用）           └─ session/ + compaction/（已落地部分）
 ```
 
 路线 A 是你现在能 `new Agent()` 跑起来的东西。路线 B 是 harness-v2 设计文档描述的、可崩溃恢复的持久化 harness——它的契约文件已经写满，但执行方法全部 `reject(HarnessNotImplemented)`（`agent-harness.ts:360`）。这是迁移状态，不是 bug。
@@ -95,6 +99,8 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 这就是 `pi-agent-core` 要解决的全部问题。它的 README 用一句话概括：
 
 ```
+# packages/agent/README.md:2
+Stateful agent with tool execution and event streaming. Built on `@earendil-works/pi-ai`.
 ```
 
 拆开看，它给你三样东西：
@@ -114,11 +120,23 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 拒绝一：不认识任何模型厂商。 全仓库搜不到一个 provider 的名字。循环拿到的模型接口是一个函数类型：
 
 ```
+// src/types.ts:28
+export type StreamFn = (
+        model: Model<Api>,
+        context: Context,
+        options?: SimpleStreamOptions,
+) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 ```
 
 它只约定形状：给我 `Model` 和 `Context`，还我一个事件流。谁来提供这个函数？隔壁的 `@earendil-works/pi-ai`——那是另一个包，有自己的 provider 目录和模型元数据。本包对它的唯一依赖就是这几个类型。注意 `StreamFn` 上方的契约注释（`src/types.ts:22`），它把"失败怎么处理"也写死了：
 
 ```
+// src/types.ts:22
+ * Contract:
+ * - Must not throw or return a rejected promise for request/model/runtime failures.
+ * - Must return an AssistantMessageEventStream.
+ * - Failures must be encoded in the returned stream via protocol events and a
+ *   final AssistantMessage with stopReason "error" or "aborted" and errorMessage.
 ```
 
 失败不抛异常、不 reject，而是编码进流里、用一条带 `stopReason: "error"` 的消息收尾。这条契约是第 1 章里"循环永远收到闭合事件流"的根——它把"出错"从一个跨边界的异常，变成了一个边界内的值。
@@ -126,6 +144,23 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 拒绝二：不碰 UI。 包里没有一行渲染代码。它对外沟通的方式只有一种：发事件。全部事件就是一个可辨识联合，十种：
 
 ```
+// src/types.ts:422
+export type AgentEvent =
+        // Agent lifecycle
+        | { type: "agent_start" }
+        | { type: "agent_end"; messages: AgentMessage[] }
+        // Turn lifecycle - a turn is one assistant response + any tool calls/results
+        | { type: "turn_start" }
+        | { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+        // Message lifecycle - emitted for user, assistant, and toolResult messages
+        | { type: "message_start"; message: AgentMessage }
+        // Only emitted for assistant messages during streaming
+        | { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
+        | { type: "message_end"; message: AgentMessage }
+        // Tool execution lifecycle
+        | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
+        | { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+        | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
 ```
 
 文字流、工具进度、生命周期，全在这十种里。你想画成终端、网页还是日志文件，是你的事。注意这十种事件分属四个层级（run / turn / message / tool），第 1 章会跟着一次真实调用把它们逐个点亮。
@@ -133,6 +168,9 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 拒绝三：核心不做持久化。 `Agent` 类的对话历史就是一个内存数组：
 
 ```
+// src/agent.ts:71（createMutableAgentState 内）
+let tools = initialState?.tools?.slice() ?? [];
+let messages = initialState?.messages?.slice() ?? [];
 ```
 
 进程退出，一切归零。持久化存在，但它在 harness 层（第 4 章），而且是"追加条目到树"的模型——核心循环对此一无所知。这是"循环只有一份"的另一面：循环不背持久化的复杂度，持久化是挂在循环外的组合层。
@@ -140,6 +178,13 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 拒绝四：核心不碰运行时 API。 `src/` 根目录里没有任何 `node:fs`、`node:child_process`。全部文件和 shell 访问都被逼到一个接口后面（`ExecutionEnv`，第 5 章细讲），唯一的 Node 实现被隔离在 `harness/env/nodejs.ts`，通过单独的入口导出：
 
 ```
+// packages/agent/package.json - exports
+{
+".":              { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+"./node":         { "types": "./dist/node.d.ts", "import": "./dist/node.js" },
+"./session/testing": { "types": "./dist/harness/session/testing/index.d.ts", 
+"import": "./dist/harness/session/testing/index.js" }
+}
 ```
 
 主入口 `.` 不带任何 Node 依赖；要用文件和 shell 工具，得显式从 `./node` 进。所以这个包的核心可以跑在浏览器里——`src/proxy.ts` 就是为此准备的。组合层（Node 实现）和循环层（纯接口）被入口分开了。
@@ -151,21 +196,49 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 都不是。看依赖方向：
 
 ```
+agent-loop.ts  (runAgentLoop — 无状态循环，793 行)
+    ▲
+    │
+agent.ts  (Agent 类, 589 行)        ← 路线 A，现在能跑
 ```
 
 `Agent` 直接调用 `runAgentLoop`，证据在它的 `runPromptMessages` 里：
 
 ```
+// src/agent.ts:405（Agent.runPromptMessages）
+private async runPromptMessages(
+        messages: AgentMessage[],
+        options: { skipInitialSteeringPoll?: boolean } = {},
+): Promise<void> {
+        await this.runWithLifecycle(async (signal) => {
+                await runAgentLoop(
+                        messages,
+                        this.createContextSnapshot(),
+                        this.createLoopConfig(options),
+                        (event) => this.processEvents(event),
+                        signal,
+                        this.streamFunction,
+                );
+        });
+}
 ```
 
 那 `AgentHarness` 呢？在 `0df5a69e` 这个基线上，它还不调用 `runAgentLoop`——它的全部执行方法都是桩：
 
 ```
+// src/harness/agent-harness.ts:360
+private unavailable<T>(operation: string): Promise<T> {
+        return Promise.reject(this.closed ? new HarnessClosed() : new HarnessNotImplemented(operation));
+}
 ```
 
 `prompt`、`steer`、`resume`、`abort`……每一个都走 `unavailable()`，reject 一个 `HarnessNotImplemented`（`agent-harness.ts:371` 起逐个可见）。设计文档把这件事写得很坦白：
 
 ```
+// docs/harness-v2.md:2887（节选：F0 工单一句见第 8 章）
+- `AgentHarness` is type-complete but not behavior-complete. Execution-bearing methods
+  reject with `HarnessNotImplemented`; some read/configuration/watch/manual-drive
+  methods still expose local scaffold behavior. […]
 ```
 
 所以此时此刻，`Agent` 是 `runAgentLoop` 唯一的消费者。但 `AgentHarness` 不是 `Agent` 的子类，也不是它的包装：按设计（`harness-v2.md:1755`，§14），它将来是同一循环原语之上的另一层组合，只是组合进去的东西多得多——持久化、压缩、hook、phase 状态机。而 `runAgentLoop` 本体，届时会被拆成 building blocks，harness 复用同一批块、在块之间插入持久化写，签名和行为不变。
@@ -229,11 +302,37 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 一次对话从哪开始？答案就一个方法：`Agent.prompt()`。它是这个包对外的脸——你在 UI 里敲一句话、在脚本里调一次接口，最后都落在这里。它接收你的输入（字符串、图片或整组消息），把这次对话跑完。看它的实现，注意三件事：它先检查什么、把消息交给谁、自己做了什么：
 
 ```
+// src/agent.ts:346（Agent.prompt）
+async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+        if (this.activeRun) {
+                throw new Error(
+                        "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+                );
+        }
+        const messages = this.normalizePromptInput(input, images);
+        await this.runPromptMessages(messages);
+}
 ```
 
 它做的第一件事和 AI 无关：检查 `activeRun`。一个 Agent 实例同一时刻只跑一个 run——想插队，走 `steer()` 或 `followUp()` 队列，这是后话。注意错误信息把三条出路直接报给你：这不是一个含糊的"busy"，而是一句指路。`prompt()` 把归一化后的消息交给 `runPromptMessages`，这里能看到后续所有准备的接线方式：
 
 ```
+// src/agent.ts:405（Agent.runPromptMessages）
+private async runPromptMessages(
+        messages: AgentMessage[],
+        options: { skipInitialSteeringPoll?: boolean } = {},
+): Promise<void> {
+        await this.runWithLifecycle(async (signal) => {
+                await runAgentLoop(
+                        messages,
+                        this.createContextSnapshot(),
+                        this.createLoopConfig(options),
+                        (event) => this.processEvents(event),
+                        signal,
+                        this.streamFunction,
+                );
+        });
+}
 ```
 
 注意顺序：`runWithLifecycle` 包在最外层，而 `createContextSnapshot()` 和 `createLoopConfig(options)` 是 `runAgentLoop` 的实参——它们在 executor 真正执行时才求值，也就是在生命周期建立之后。
@@ -243,11 +342,45 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 第一件，快照上下文：
 
 ```
+// src/agent.ts:433（Agent.createContextSnapshot）
+private createContextSnapshot(): AgentContext {
+        return {
+                systemPrompt: this._state.systemPrompt,
+                messages: this._state.messages.slice(),
+                tools: this._state.tools.slice(),
+        };
+}
 ```
 
 注意消息数组是浅拷贝——循环会往里推新消息，但替换不了调用方手里那个数组的引用。第二件，装配循环配置（`src/agent.ts:441`），把 `Agent` 实例上的回调和两个队列的 drain 函数打包成 `AgentLoopConfig`。这一步的直觉是：循环不认 `Agent` 实例，只认一张配置表——模型、工具、钩子、队列拉取函数全部摊在表里，循环按表取用：
 
 ```
+// src/agent.ts:441（Agent.createLoopConfig，删减）
+private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
+        let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+        const shouldStopAfterTurn = this.shouldStopAfterTurn;
+        return {
+                model: this._state.model,
+                reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
+                // ...（onPayload / onResponse / transport / thinkingBudgets 等透传键，折叠）toolExecution: this.toolExecution,
+                beforeToolCall: this.beforeToolCall,
+                afterToolCall: this.afterToolCall,
+                shouldStopAfterTurn: shouldStopAfterTurn
+                        ? async (context) => await shouldStopAfterTurn(context, this.signal)
+                        : undefined,
+                // ...（prepareNextTurn 的适配器，折叠，见本章"岔路"）convertToLlm: this.convertToLlm,
+                transformContext: this.transformContext,
+                getApiKey: this.getApiKey,
+                getSteeringMessages: async () => {
+                        if (skipInitialSteeringPoll) {
+                                skipInitialSteeringPoll = false;
+                                return [];
+                        }
+                        return this.steeringQueue.drain();
+                },
+                getFollowUpMessages: async () => this.followUpQueue.drain(),
+        };
+}
 ```
 
 两个队列的 drain 函数被打包成了 `getSteeringMessages` / `getFollowUpMessages` 两个回调——循环在固定点 poll 它们（本章"两层结构"一节会看到 poll 的位置）。`skipInitialSteeringPoll` 是个一次性的闸：`continue()` 路径已经 drain 过 steering，进循环时跳过第一次 poll，避免重复注入。
@@ -255,6 +388,31 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 两个实参准备好了。回到外层：`runWithLifecycle` 建立一个 `AbortController`、登记 `activeRun`、置 `isStreaming = true`，然后才执行 executor：
 
 ```
+// src/agent.ts:482（Agent.runWithLifecycle）
+private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+        if (this.activeRun) {
+                throw new Error("Agent is already processing.");
+        }
+
+        const abortController = new AbortController();
+        let resolvePromise = () => {};
+        const promise = new Promise<void>((resolve) => {
+                resolvePromise = resolve;
+        });
+        this.activeRun = { promise, resolve: resolvePromise, abortController };
+
+        this._state.isStreaming = true;
+        this._state.streamingMessage = undefined;
+        this._state.errorMessage = undefined;
+
+        try {
+                await executor(abortController.signal);
+        } catch (error) {
+                await this.handleRunFailure(error, abortController.signal.aborted);
+        } finally {
+                this.finishRun();
+        }
+}
 ```
 
 `promise` / `resolvePromise` 这三行是一个"手动引爆的 Promise"：`new Promise` 的 executor 是同步执行的，所以构造完成的瞬间，`resolvePromise` 就拿到了这个 Promise 的 resolve 函数。这个 Promise 的用途，本章"收尾"一节会拆开用到——它是 `waitForIdle()` 的扳机。
@@ -266,6 +424,18 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 模式一：executor 回调（"你带活儿来，我管前后"）。 `runWithLifecycle` 自己不干活，它收一个函数 `(signal) => Promise<void>` 当参数。为什么不让它直接调用 `runAgentLoop`？因为有两个调用方想共用同一套"前后手续"，但干的活不一样——`runPromptMessages` 跑 `runAgentLoop`，`runContinuation` 跑 `runAgentLoopContinue`（`src/agent.ts:421`）：
 
 ```
+// src/agent.ts:421（Agent.runContinuation）
+private async runContinuation(): Promise<void> {
+        await this.runWithLifecycle(async (signal) => {
+                await runAgentLoopContinue(
+                        this.createContextSnapshot(),
+                        this.createLoopConfig(),
+                        (event) => this.processEvents(event),
+                        signal,
+                        this.streamFunction,
+                );
+        });
+}
 ```
 
 把"活"抽象成参数，前后的手续（建 controller、登记、置状态、兜异常、收尾）就只写一份。本质是把不变的括号和可变的内容分开。
@@ -275,6 +445,10 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 所以这是一个单向的取消广播：只有创建者能取消，所有下游只能服从。 看 `runWithLifecycle` 里 signal 的旅程：controller 在这里创建，signal 交给 executor → executor 传给 `runAgentLoop` → 循环再传给 `streamFn`（取消 HTTP 请求）和每个工具的 `execute()`（终止正在跑的命令）。而按按钮的手在别处：
 
 ```
+// src/agent.ts:319（Agent.abort）
+abort(): void {
+        this.activeRun?.abortController.abort();
+}
 ```
 
 你在 UI 上点"停止" → `agent.abort()` → controller 按下。注意 `abort()` 本身没有任何队列或时机判断——它就是同步按按钮，所以"什么时候停"不取决于循环转到哪，而取决于听到广播的三方各自多快响应。第 3 章会拆这三个响应方；这里只要记住：abort 结束的是整个 run，不是当前 turn。
@@ -284,6 +458,30 @@ pi 是一个正在迁移的 monorepo。读任何一页之前，先记住这张�
 executor 跑起来，调用 `runAgentLoop`。它先把 prompt 消息追加进上下文，发出 `agent_start`、`turn_start` 和 prompt 自己的 `message_start`/`message_end`，然后把控制权交给真正的引擎 `runLoop`：
 
 ```
+// src/agent-loop.ts:95（删减）
+export async function runAgentLoop(prompts: AgentMessage[],
+        context: AgentContext,
+        config: AgentLoopConfig,
+        emit: AgentEventSink,
+        signal: AbortSignal | undefined,
+        streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+        const newMessages: AgentMessage[] = [...prompts];
+        const currentContext: AgentContext = {
+                ...context,
+                messages: [...context.messages, ...prompts],
+        };
+
+        await emit({ type: "agent_start" });
+        await emit({ type: "turn_start" });
+        for (const prompt of prompts) {
+                await emit({ type: "message_start", message: prompt });
+                await emit({ type: "message_end", message: prompt });
+        }
+
+        await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+        return newMessages;
+}
 ```
 
 注意两个数组的不同命运。`newMessages` 是 `runAgentLoop` 新建的（`[...prompts]`），交给 `runLoop` 填充，跑完原样 `return` 给调用方——就地推消息是结果回传的通道。`currentContext.messages` 则另起了新数组（`[...context.messages, ...prompts]`），循环往里推多少条，调用方手里的 `context.messages`（也就是 `Agent` 的 `state.messages` 快照）都纹丝不动。一个负责回报结果，一个负责隔离副作用。
@@ -293,6 +491,95 @@ executor 跑起来，调用 `runAgentLoop`。它先把 prompt 消息追加进上
 `runLoop` 这个"真正的引擎"里，循环到底在哪里？先说清楚"循环"指什么。日常说的"agent 循环"是模型 → 工具 → 模型的往复：模型产出工具调用，工具结果喂回模型，模型再产出，直到没有工具调用为止。这个往复在代码里不是递归，是迭代——`runLoop` 里的一个 `while`。而 `runLoop` 里其实有两个 `while`，这就是"两层结构"的字面出处。把真实代码摆出来（只折叠 `prepareNextTurn` 块——它是岔路不是主干，见本章"岔路"专节；其余逐行保真）：
 
 ```
+// src/agent-loop.ts:155（折叠 prepareNextTurn 块；其余逐行保真）
+async function runLoop(initialContext: AgentContext,
+        newMessages: AgentMessage[],
+        initialConfig: AgentLoopConfig,
+        signal: AbortSignal | undefined,
+        emit: AgentEventSink,
+        streamFunction: StreamFn,
+): Promise<void> {
+        let currentContext = initialContext;
+        let config = initialConfig;
+        let firstTurn = true;
+        // Check for steering messages at start (user may have typed while waiting)let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+        // Outer loop: continues when queued follow-up messages arrive after agent would stopwhile (true) {
+                let hasMoreToolCalls = true;
+
+                // Inner loop: process tool calls and steering messageswhile (hasMoreToolCalls || pendingMessages.length > 0) {
+                        if (!firstTurn) {
+                                await emit({ type: "turn_start" });
+                        } else {
+                                firstTurn = false;
+                        }
+
+                        // Process pending messages (inject before next assistant response)if (pendingMessages.length > 0) {
+                                for (const message of pendingMessages) {
+                                        await emit({ type: "message_start", message });
+                                        await emit({ type: "message_end", message });
+                                        currentContext.messages.push(message);
+                                        newMessages.push(message);
+                                }
+                                pendingMessages = [];
+                        }
+
+                        // Stream assistant responseconst message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+                        newMessages.push(message);
+
+                        if (message.stopReason === "error" || message.stopReason === "aborted") {
+                                await emit({ type: "turn_end", message, toolResults: [] });
+                                await emit({ type: "agent_end", messages: newMessages });
+                                return;
+                        }
+
+                        // Check for tool callsconst toolCalls = message.content.filter((c) => c.type === "toolCall");
+
+                        const toolResults: ToolResultMessage[] = [];
+                        hasMoreToolCalls = false;
+                        if (toolCalls.length > 0) {
+                                // A "length" stop means the output was cut off by the token limit, so// every tool call in the message may carry truncated arguments. Fail// them all instead of executing potentially borked calls.const executedToolBatch =
+                                        message.stopReason === "length"
+                                                ? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+                                                : await executeToolCalls(currentContext, message, config, signal, emit);
+                                toolResults.push(...executedToolBatch.messages);
+                                hasMoreToolCalls = !executedToolBatch.terminate;
+
+                                for (const result of toolResults) {
+                                        currentContext.messages.push(result);
+                                        newMessages.push(result);
+                                }
+                        }
+
+                        await emit({ type: "turn_end", message, toolResults });
+
+                        // ...（prepareNextTurn：两圈之间换快照的岔路，折叠，见下文专节）if (
+                                await config.shouldStopAfterTurn?.({
+                                        message,
+                                        toolResults,
+                                        context: currentContext,
+                                        newMessages,
+                                })
+                        ) {
+                                await emit({ type: "agent_end", messages: newMessages });
+                                return;
+                        }
+
+                        pendingMessages = (await config.getSteeringMessages?.()) || [];
+                }
+
+                // Agent would stop here. Check for follow-up messages.const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+                if (followUpMessages.length > 0) {
+                        // Set as pending so inner loop processes them
+                        pendingMessages = followUpMessages;
+                        continue;
+                }
+
+                // No more messages, exitbreak;
+        }
+
+        await emit({ type: "agent_end", messages: newMessages });
+}
 ```
 
 内层 `while` 转一圈 = 一个 turn：注入插队消息（如果有）→ 调一次模型 → 执行工具（如果有）→ `turn_end`。它的退出条件 `hasMoreToolCalls || pendingMessages.length > 0` 读作"模型没要新工具，也没人插队"——日常说的"agent 跑完了"，在代码里就是这个条件变假。
@@ -314,6 +601,12 @@ executor 跑起来，调用 `runAgentLoop`。它先把 prompt 消息追加进上
 内层循环的核心动作是 `streamAssistantResponse`。在真正发出请求之前，消息要过两道闸门：
 
 ```
+// src/agent-loop.ts:289（streamAssistantResponse 内）let messages = context.messages;
+if (config.transformContext) {
+        messages = await config.transformContext(messages, signal);
+}
+
+// Convert to LLM-compatible messages (AgentMessage[] -> Message[])const llmMessages = await config.convertToLlm(messages);
 ```
 
 - `transformContext`（可选）：直接操作 agent 侧的消息数组——剪掉老消息、注入外部上下文。输入输出都是 `AgentMessage[]`。
@@ -323,6 +616,10 @@ executor 跑起来，调用 `runAgentLoop`。它先把 prompt 消息追加进上
 这两道闸门是全书最重要的设计之一，第 10 章会展开。这里只需要记住文件头注释写的那句话：
 
 ```
+// src/agent-loop.ts:1/**
+ * Agent loop that works with AgentMessage throughout.
+ * Transforms to Message[] only at the LLM call boundary.
+ */
 ```
 
 循环本体从头到尾只说 `AgentMessage`，翻译只发生在 LLM 调用边界上。 这是"循环只有一份"的另一种表达：循环不认识 provider 的消息格式，翻译是边界上的组合层。
@@ -330,6 +627,54 @@ executor 跑起来，调用 `runAgentLoop`。它先把 prompt 消息追加进上
 过了闸门，调 `streamFn`，事件开始回流。循环拿着流事件维护一份"正在成形的消息"（`partialMessage`），就地更新，同时向订阅者转发：
 
 ```
+// src/agent-loop.ts:314（streamAssistantResponse 内）let partialMessage: AssistantMessage | null = null;
+let addedPartial = false;
+
+for await (const event of response) {
+        switch (event.type) {
+                case "start":
+                        partialMessage = event.partial;
+                        context.messages.push(partialMessage);
+                        addedPartial = true;
+                        await emit({ type: "message_start", message: { ...partialMessage } });
+                        break;
+
+                case "text_start":
+                case "text_delta":
+                case "text_end":
+                case "thinking_start":
+                case "thinking_delta":
+                case "thinking_end":
+                case "toolcall_start":
+                case "toolcall_delta":
+                case "toolcall_end":
+                        if (partialMessage) {
+                                partialMessage = event.partial;
+                                context.messages[context.messages.length - 1] = partialMessage;
+                                await emit({
+                                        type: "message_update",
+                                        assistantMessageEvent: event,
+                                        message: { ...partialMessage },
+                                });
+                        }
+                        break;
+
+                case "done":
+                case "error": {
+                        const finalMessage = await response.result();
+                        if (addedPartial) {
+                                context.messages[context.messages.length - 1] = finalMessage;
+                        } else {
+                                context.messages.push(finalMessage);
+                        }
+                        if (!addedPartial) {
+                                await emit({ type: "message_start", message: { ...finalMessage } });
+                        }
+                        await emit({ type: "message_end", message: finalMessage });
+                        return finalMessage;
+                }
+        }
+}
 ```
 
 九种增量事件（text/thinking/toolcall 各 start/delta/end）能共用一个函数体，是因为流事件个个带一份完整的 `partial` 快照，不是增量，是"到目前为止的整条消息"。所以循环不需要分辨来的是哪一组：`partialMessage = event.partial` 整体换上，就地更新，覆盖的最后一格正是 `start` 时 `push` 进去占位的那个。收到 `done`（或 `error`），`response.result()` 取出最终消息，替换占位格，发 `message_end`，这一轮模型调用结束。
@@ -339,6 +684,10 @@ executor 跑起来，调用 `runAgentLoop`。它先把 prompt 消息追加进上
 assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。入口处有一个容易漏掉的守卫——输出被 token 上限截断时（`stopReason: "length"`），每个工具调用的参数都可能是残缺的 JSON，全部标记为错误，一个都不执行，让模型自己重新发一遍：
 
 ```
+// src/agent-loop.ts:208// A "length" stop means the output was cut off by the token limit, so// every tool call in the message may carry truncated arguments. Fail// them all instead of executing potentially borked calls.const executedToolBatch =
+        message.stopReason === "length"
+                ? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+                : await executeToolCalls(currentContext, message, config, signal, emit);
 ```
 
 正常情况下，进入 `executeToolCalls`，每个工具调用走三段管线：prepare（找工具、校验参数、问 `beforeToolCall` 放不放行）→ execute（真正调 `tool.execute()`）→ finalize（问 `afterToolCall` 要不要改写结果）。这里跟一遍主路就够，管线的完整契约留给第 2 章。
@@ -354,6 +703,26 @@ assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。�
 先说这段代码回答什么问题：run 跑到一半，宿主想换上下文、换模型、换思考强度——比如 coding agent 发现当前任务需要更强的模型。循环怎么给宿主留这个口子？答案是 `prepareNextTurn` 这个可空回调：每个 turn 结束时循环问一句"要换装备吗"，宿主答"要"就换，答不上来就保持原样。下面这段是循环层的调用现场，注意回调的入参出参形状：
 
 ```
+// src/agent-loop.ts:226const nextTurnContext = {
+        message,
+        toolResults,
+        context: currentContext,
+        newMessages,
+};
+const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
+if (nextTurnSnapshot) {
+        currentContext = nextTurnSnapshot.context ?? currentContext;
+        config = {
+                ...config,
+                model: nextTurnSnapshot.model ?? config.model,
+                reasoning:
+                        nextTurnSnapshot.thinkingLevel === undefined
+                                ? config.reasoning
+                                : nextTurnSnapshot.thinkingLevel === "off"
+                                        ? undefined
+                                        : nextTurnSnapshot.thinkingLevel,
+        };
+}
 ```
 
 它回答的问题是：一个 run 跑到一半，宿主想换上下文、换模型、换思考强度怎么办？ 快照的每个字段都可缺省，缺省就 `??` 回落到当前值——宿主可以只换模型不动上下文，反之亦然。`thinkingLevel: "off"` 被显式翻译成 `reasoning: undefined`，因为下游契约是用"没有 reasoning 字段"而不是 `"off"` 来表达关闭——那个三层三元表达式就是在做词汇表对齐。
@@ -365,21 +734,58 @@ assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。�
 `AgentEvent` 的事件分属四个层级，不同层级各有来源：
 
 ```
+run      agent_start · agent_end              ← 骨架（「循环的两层结构」）
+turn     turn_start · turn_end                ← 骨架，内层循环每圈
+message  message_start · message_update · message_end  ← 回流（assistant）· 注入（prompt、插队、follow-up）
+tool     tool_execution_start · _update · _end          ← 工具管线（「执行工具」）
 ```
 
 四个层级的事件全都流过 `Agent.processEvents`。它做两件事：先把事件归约进状态，然后逐个 await 所有订阅者：
 
 ```
+// src/agent.ts:540（Agent.processEvents 内，删减）private async processEvents(event: AgentEvent): Promise<void> {
+        switch (event.type) {
+                case "message_end":
+                        this._state.streamingMessage = undefined;
+                        this._state.messages.push(event.message);
+                        break;
+                case "tool_execution_start": {
+                        const pendingToolCalls = new Set(this._state.pendingToolCalls);
+                        pendingToolCalls.add(event.toolCallId);
+                        this._state.pendingToolCalls = pendingToolCalls;
+                        break;
+                }
+                // ...（message_start / message_update / tool_execution_end / turn_end / agent_end 各 case，折叠）
+        }
+
+        const signal = this.activeRun?.abortController.signal;
+        if (!signal) {
+                throw new Error("Agent listener invoked outside active run");
+        }
+        for (const listener of this.listeners) {
+                await listener(event, signal);
+        }
+}
 ```
 
 "逐个 await"是 `Agent` 和裸循环之间最实质的差别——订阅者的异步处理是 run 结算的一部分。`agent_end` 发出 ≠ run 结束；所有 `agent_end` 监听器跑完，`finishRun()` 清掉运行时状态，`waitForIdle()` 才 resolve：
 
 ```
+// src/agent.ts:525（Agent.finishRun）private finishRun(): void {
+        this._state.isStreaming = false;
+        this._state.streamingMessage = undefined;
+        this._state.pendingToolCalls = new Set<string>();
+        this.activeRun?.resolve();
+        this.activeRun = undefined;
+}
 ```
 
 而 `waitForIdle()` 返回的就是 `runWithLifecycle` 里那个手动引爆的 Promise：
 
 ```
+// src/agent.ts:328（Agent.waitForIdle）waitForIdle(): Promise<void> {
+        return this.activeRun?.promise ?? Promise.resolve();
+}
 ```
 
 这段三行代码值得拆成六个问题读，每个问题都有一条真实证据：
@@ -393,6 +799,10 @@ assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。�
 4. 它在哪里被调用？ 这个包自己的生产代码里没有调用点，`waitForIdle()` 是纯公开 API，调用方在库外。仓库里的真实用法有两类。一类是测试，断言前等落定，`coding-agent` 的导航测试每步 prompt 后都等它：
 
 ```
+// packages/coding-agent/test/agent-session-tree-navigation.test.ts:33await session.prompt("First message");
+await session.agent.waitForIdle();
+await session.prompt("Second message");
+await session.agent.waitForIdle();
 ```
 
 注意第二行 `await session.prompt(...)` 本身就会等到结算，测试为什么还要再等一次？因为测试的下一行要读 `sessionManager.getTree()`，树的最新状态是监听器写进去的，而监听器在 prompt 返回之后还在跑。等 idle 就是等"监听器也全部跑完"。另一类调用点是下游包装层的 abort 流程，按了停止必须等它真的安静才能返回，这个证据链在第 8 章讲 harness 契约时会用到。
@@ -402,6 +812,8 @@ assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。�
 2. 保证的反面：在监听器里 await 它，会死锁。 同一条结算语义，站错位置就是陷阱。监听器里 `await agent.waitForIdle()`，等的是结算；而结算在等你——`processEvents` 逐个 await 监听器，你不 return，`executor` 就不算跑完，`activeRun.promise` 就不 resolve；你又在等它 resolve——环闭合了。不需要线程参与，Promise 依赖成环就够了，而且没有任何超时或 abort 能打破它。harness 层的设计文档把这个坑明确写了出来：
 
 ```
+// docs/harness-v2.md:730（节选）
+runWhenIdle(callback: () => void | Promise<void>): Promise<void>;   // runtime-only
 ```
 
 出路是换一个方向：把回调传进去，自己的监听器正常 return，结算照常完成；链走完后 harness 再来调这个回调，返回的 Promise 等回调跑完才 resolve——从登记那一刻起，你就不在依赖环里。注意在当前基线上它只是签名 + 桩实现（`agent-harness.ts:413`：`async runWhenIdle(callback) { await callback(); }`），行为等 F0 落地。一句话记住这条边界：`waitForIdle()` 是旁观者的工具，参与者碰不得。
@@ -411,6 +823,12 @@ assistant 消息里如果带着 `toolCall` 内容块，就进入工具执行。�
 一次 `prompt()` 的全程：
 
 ```
+prompt() → runPromptMessages → runWithLifecycle → runAgentLoop(快照, 装配) → runLoop
+  ├─ transformContext → convertToLlm → streamFn（流式）
+  ├─ prepare → execute → finalize（工具三段管线）
+  ├─ turn_end → prepareNextTurn? → shouldStopAfterTurn? → steering?
+  └─ follow-up? → 外层再来一圈
+→ agent_end → await 所有监听器 → finishRun → waitForIdle resolve
 ```
 
 turn 结束后的四个决策点，按代码里的询问顺序（对照骨架引文 `agent-loop.ts:226-272`）：
